@@ -22,7 +22,7 @@ interface MessageHistoryProps {
   usageData?: Usage;
 }
 
-export default function MessageHistory({ messages, showReasoning = true, usageData }: MessageHistoryProps) {
+function MessageHistory({ messages, showReasoning = true, usageData }: MessageHistoryProps) {
   const scrollRef = useRef<any>(null);
 
   // Auto-scroll to bottom when new messages are added
@@ -163,10 +163,10 @@ export default function MessageHistory({ messages, showReasoning = true, usageDa
       {messages.length === 0 ? (
         <Box justifyContent="center" paddingY={2} flexDirection="column" alignItems="center">
           <Text color="gray" dimColor italic>
-            Ask for help with coding tasks, debugging issues, or explaining code.
+            Assistente de código Groq com streaming em tempo real, memória de sessão e failover automático de modelos.
           </Text>
           <Text color="gray" dimColor italic>
-            Type /help for available commands and features.
+            Dicas: /sessions lista conversas salvas · /resume &lt;nº&gt; retoma · /rename renomeia · /help para todos os comandos.
           </Text>
         </Box>
       ) : (
@@ -175,3 +175,13 @@ export default function MessageHistory({ messages, showReasoning = true, usageDa
     </Box>
   );
 }
+
+// Memoização anti-flicker: só re-renderiza o histórico quando as mensagens
+// realmente mudarem (evita repaint completo a cada tick do timer do Termux!)
+export default React.memo(
+  MessageHistory,
+  (prev, next) =>
+    prev.messages === next.messages &&
+    prev.showReasoning === next.showReasoning &&
+    (prev.usageData?.total_tokens ?? 0) === (next.usageData?.total_tokens ?? 0)
+);

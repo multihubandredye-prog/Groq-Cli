@@ -46,6 +46,7 @@ export function useAgent(
   const [sessionAutoApprove, setSessionAutoApprove] = useState(false);
   const [showReasoning, setShowReasoning] = useState(true);
   const currentExecutionIdRef = useRef<string | null>(null);
+  const streamingIdRef = useRef<string | null>(null);
   const [pendingApproval, setPendingApproval] = useState<{
     toolName: string;
     toolArgs: Record<string, any>;
@@ -95,24 +96,43 @@ export function useAgent(
 
     setIsProcessing(true);
 
+    // Finaliza a mensagem que estava sendo transmitida em tempo real (ou cria uma nova)
+    const finalizeStreamedAssistant = (content: string, reasoning?: string) => {
+      if (streamingIdRef.current) {
+        updateMessage(streamingIdRef.current, { content, reasoning });
+        streamingIdRef.current = null;
+      } else {
+        addMessage({
+          role: 'assistant',
+          content,
+          reasoning,
+        });
+      }
+    };
+
     try {
       // Set up tool execution callbacks
       agent.setToolCallbacks({
+        onStreamDelta: (delta: { content: string; reasoning: string }) => {
+          // Streaming em tempo real: UMA única mensagem é atualizada com o texto acumulado
+          const hasText = (delta.content || '').length > 0 || (delta.reasoning || '').length > 0;
+          if (!hasText) return;
+          if (streamingIdRef.current) {
+            updateMessage(streamingIdRef.current, { content: delta.content, reasoning: delta.reasoning || undefined });
+          } else {
+            streamingIdRef.current = addMessage({
+              role: 'assistant',
+              content: delta.content || '',
+              reasoning: delta.reasoning || undefined,
+            });
+          }
+        },
         onThinkingText: (content: string, reasoning?: string) => {
-          // Add thinking text as assistant message when model uses tools
-          addMessage({
-            role: 'assistant',
-            content: content,
-            reasoning: reasoning,
-          });
+          // Fecha o streaming (mensagem única) em vez de duplicar a mensagem
+          finalizeStreamedAssistant(content, reasoning);
         },
         onFinalMessage: (content: string, reasoning?: string) => {
-          // Add final assistant message when no tools are used
-          addMessage({
-            role: 'assistant',
-            content: content,
-            reasoning: reasoning,
-          });
+          finalizeStreamedAssistant(content, reasoning);
         },
         onToolStart: (name: string, args: Record<string, any>) => {
           const toolExecution: ToolExecution = {
@@ -311,6 +331,7 @@ export function useAgent(
     } finally {
       setIsProcessing(false);
       setCurrentToolExecution(null);
+      streamingIdRef.current = null;
       
       // Complete the request tracking
       if (onCompleteRequest) {
@@ -357,6 +378,14 @@ export function useAgent(
     agent.clearHistory();
   }, [agent]);
 
+  // Limpa apenas a UI (usado ao retomar uma sessão salva — as mensagens restauradas
+  // ficam no agente e reaparecem conforme a conversa continua)
+  const resetMessages = useCallback(() => {
+    streamingIdRef.current = null;
+    setMessages([]);
+    setUserMessageHistory([]);
+  }, []);
+
   const interruptRequest = useCallback(() => {
     agent.interrupt();
     setIsProcessing(false);
@@ -390,6 +419,7 @@ export function useAgent(
     addMessage,
     setApiKey,
     clearHistory,
+    resetMessages,
     toggleAutoApprove,
     toggleReasoning,
     interruptRequest,

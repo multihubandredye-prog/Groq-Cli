@@ -72,6 +72,7 @@ export default function Chat({ agent }: ChatProps) {
     addMessage,
     setApiKey,
     clearHistory,
+    resetMessages,
     toggleAutoApprove,
     toggleReasoning,
     interruptRequest,
@@ -143,6 +144,8 @@ export default function Chat({ agent }: ChatProps) {
           toggleReasoning,
           showReasoning,
           sessionStats,
+          agent,
+          resetMessages,
         });
         return;
       }
@@ -283,6 +286,9 @@ export default function Chat({ agent }: ChatProps) {
           <Text color="cyan" bold>
             {sessionAutoApprove ? 'auto-approve edits is on' : ''}
           </Text>
+          {agent.getSessionTitle?.() ? (
+            <Text color="magenta"> · 💾 {agent.getSessionTitle()}</Text>
+          ) : null}
         </Box>
         <Box>
           <Text color="gray" dimColor>

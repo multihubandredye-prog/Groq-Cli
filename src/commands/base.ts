@@ -5,6 +5,9 @@ export interface CommandContext {
   setShowModelSelector?: (show: boolean) => void;
   toggleReasoning?: () => void;
   showReasoning?: boolean;
+  args?: string;
+  agent?: any;
+  resetMessages?: () => void;
   sessionStats?: {
     promptTokens: number;
     completionTokens: number;

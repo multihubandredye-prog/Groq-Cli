@@ -1,7 +1,7 @@
 import Groq from 'groq-sdk';
 import type { ClientOptions } from 'groq-sdk';
 import { executeTool } from '../tools/tools.js';
-import { validateReadBeforeEdit, getReadBeforeEditError } from '../tools/validators.js';
+import { validateReadBeforeEdit, getReadBeforeEditError, markFileAsRead } from '../tools/validators.js';
 import { ALL_TOOL_SCHEMAS, DANGEROUS_TOOLS, APPROVAL_REQUIRED_TOOLS } from '../tools/tool-schemas.js';
 import { ConfigManager } from '../utils/local-settings.js';
 import { getProxyAgent, getProxyInfo } from '../utils/proxy-config.js';
@@ -11,6 +11,11 @@ import {
   supportsParallelToolCalls,
   getOptimalReasoningEffort,
 } from '../utils/models.js';
+import {
+  SavedSession,
+  saveSession,
+  findSessionByQuery,
+} from '../utils/session-store.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -123,6 +128,7 @@ export class Agent {
   private onApiUsage?: (usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number; total_time?: number }) => void;
   private onError?: (error: string) => Promise<boolean>;
   private onStatus?: (message: string) => void;
+  private onStreamDelta?: (delta: { content: string; reasoning: string }) => void;
   private requestCount: number = 0;
   private currentAbortController: AbortController | null = null;
   private isInterrupted: boolean = false;
@@ -132,6 +138,12 @@ export class Agent {
   private editLedger: string[] = [];
   private readResultCache = new Map<string, { content: any; message: string }>();
   private readCacheIndex = new Map<string, Set<string>>(); // canonical path -> cache keys
+
+  // ── Session memory (auto-save/resume em ~/.groq/sessions) + aprovação por arquivo ──
+  private sessionId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+  private sessionCreatedAt = new Date().toISOString();
+  private sessionTitle = '';
+  private approvedFiles = new Set<string>();
 
   private constructor(
     model: string,
@@ -205,7 +217,9 @@ export class Agent {
   private buildDefaultSystemMessage(): string {
     return `You are a coding assistant powered by ${this.model} on Groq (Free Tier: only 8.000 tokens/min — BE TOKEN-EFFICIENT in every tool call).
 
-LANGUAGE: Always respond in the same language the user writes in (Portuguese/Brazilian Portuguese if they write in Portuguese). Keep final answers short: 1-3 sentences plus a brief summary of what changed.
+LANGUAGE: Always respond in the same language the user writes in (Portuguese/Brazilian Portuguese if they write in Portuguese) — including your reasoning/thinking text. Keep final answers short: 1-3 sentences plus a brief summary of what changed.
+
+THINKING: Plan before acting. Before the first tool call, reason about the goal, the exact files/lines involved and the edit strategy. Think carefully on every code modification (exact old_text, line ranges, side effects) instead of rushing — quality over speed.
 
 TOOLS (all accept absolute Android paths like /storage/emulated/0/Download/file.html, ~/ paths, or relative paths — never waste turns listing directories to "find" a file whose path you already know):
 - read_file: without start_line/end_line, files >180 lines return a structural OUTLINE + first 90 lines instead of the full content. NEVER re-read the same file/region twice in a session.
@@ -246,6 +260,7 @@ When asked about your identity, identify yourself as a coding assistant running 
     onApiUsage?: (usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number; total_time?: number }) => void;
     onError?: (error: string) => Promise<boolean>;
     onStatus?: (message: string) => void;
+    onStreamDelta?: (delta: { content: string; reasoning: string }) => void;
   }) {
     this.onToolStart = callbacks.onToolStart;
     this.onToolEnd = callbacks.onToolEnd;
@@ -256,6 +271,7 @@ When asked about your identity, identify yourself as a coding assistant running 
     this.onApiUsage = callbacks.onApiUsage;
     this.onError = callbacks.onError;
     this.onStatus = callbacks.onStatus;
+    this.onStreamDelta = callbacks.onStreamDelta;
   }
 
   private notifyStatus(message: string): void {
@@ -312,7 +328,15 @@ When asked about your identity, identify yourself as a coding assistant running 
   }
 
   public clearHistory(): void {
-    // Reset messages to only contain system messages
+    // /clear inicia uma sessão NOVA (a anterior permanece salva em ~/.groq/sessions)
+    this.sessionId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+    this.sessionCreatedAt = new Date().toISOString();
+    this.sessionTitle = '';
+    this.approvedFiles.clear();
+    this.sessionFileLedger.clear();
+    this.editLedger.length = 0;
+    this.readResultCache.clear();
+    this.readCacheIndex.clear();
     this.messages = this.messages.filter(msg => msg.role === 'system');
   }
 
@@ -735,6 +759,15 @@ When asked about your identity, identify yourself as a coding assistant running 
   // ───────────────────────────────────────────────────────────────────────────
 
   async chat(userInput: string): Promise<void> {
+    try {
+      await this.chatInner(userInput);
+    } finally {
+      // Auto-save da conversa após CADA turno — memória persistente em ~/.groq/sessions/
+      this.persistSession();
+    }
+  }
+
+  private async chatInner(userInput: string): Promise<void> {
     // Reset interrupt flag at the start of a new chat
     this.isInterrupted = false;
 
@@ -764,6 +797,11 @@ When asked about your identity, identify yourself as a coding assistant running 
 
     // Add user message
     this.messages.push({ role: 'user', content: userInput });
+
+    // Título padrão da sessão = primeiro pedido do usuário
+    if (!this.sessionTitle) {
+      this.sessionTitle = userInput.replace(/\s+/g, ' ').trim().slice(0, 48) || 'Sessão sem título';
+    }
 
     const maxIterations = 50;
     let iteration = 0;
@@ -1003,7 +1041,6 @@ When asked about your identity, identify yourself as a coding assistant running 
       tool_choice: 'auto',
       temperature: this.temperature,
       max_tokens: maxTokens,
-      stream: false,
     };
 
     // Only request parallel tool calls on models that actually support it
@@ -1074,9 +1111,7 @@ When asked about your identity, identify yourself as a coding assistant running 
         }
 
         this.currentAbortController = new AbortController();
-        const response = await this.client!.chat.completions.create(request, {
-          signal: this.currentAbortController.signal,
-        });
+        const response = await this.streamCompletion(request);
 
         // Success — adopt the model that answered
         if (model !== this.model) {
@@ -1199,6 +1234,82 @@ When asked about your identity, identify yourself as a coding assistant running 
   }
 
   /**
+   * Executa a requisição em MODO STREAMING: o raciocínio (reasoning) e o texto
+   * aparecem em tempo real no terminal enquanto o modelo pensa, e as tool calls
+   * são acumuladas dos deltas até o fim. Erros no meio do stream propagam para
+   * o mesmo fluxo de failover de modelo/chave.
+   */
+  private async streamCompletion(request: any): Promise<any> {
+    const stream: any = await this.client!.chat.completions.create(
+      { ...request, stream: true, stream_options: { include_usage: true } } as any,
+      { signal: this.currentAbortController!.signal }
+    );
+
+    let content = '';
+    let reasoning = '';
+    const toolCallsAcc: any[] = [];
+    let finishReason: string | null = null;
+    let usage: any = null;
+    let lastEmit = 0;
+
+    const emitDelta = (force = false) => {
+      if (!this.onStreamDelta) return;
+      const now = Date.now();
+      if (!force && now - lastEmit < 60) return; // throttle ~16fps p/ não piscar o terminal
+      lastEmit = now;
+      try {
+        this.onStreamDelta({ content, reasoning });
+      } catch {
+        // callback de UI nunca quebra o agente
+      }
+    };
+
+    try {
+      for await (const chunk of stream) {
+        const choice = chunk?.choices?.[0];
+        const delta: any = choice?.delta || {};
+        if (delta.reasoning) reasoning += delta.reasoning;
+        if (delta.content) content += delta.content;
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const idx = typeof tc.index === 'number' ? tc.index : 0;
+            if (!toolCallsAcc[idx]) {
+              toolCallsAcc[idx] = {
+                id: tc.id || `call_${idx}`,
+                type: 'function',
+                function: { name: tc.function?.name || '', arguments: tc.function?.arguments || '' },
+              };
+            } else {
+              if (tc.id) toolCallsAcc[idx].id = tc.id;
+              if (tc.function?.name) toolCallsAcc[idx].function.name += tc.function.name;
+              if (tc.function?.arguments) toolCallsAcc[idx].function.arguments += tc.function.arguments;
+            }
+          }
+        }
+        if (choice?.finish_reason) finishReason = choice.finish_reason;
+        if ((chunk as any).usage) usage = (chunk as any).usage;
+        if (delta.content || delta.reasoning) emitDelta();
+      }
+    } catch (error) {
+      // Falha no meio do stream → mesmo fluxo de failover (compaction/modelo/chave)
+      debugLog('Stream interrupted mid-response:', error);
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+
+    emitDelta(true);
+
+    const message: any = { role: 'assistant', content };
+    const calls = toolCallsAcc.filter(Boolean);
+    if (calls.length > 0) message.tool_calls = calls;
+    if (reasoning) message.reasoning = reasoning;
+
+    return {
+      choices: [{ message, finish_reason: finishReason || 'stop' }],
+      usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    };
+  }
+
+  /**
    * Recover from HTTP 400 `tool_use_failed`: keep the raw generation as an
    * assistant turn and ask the model to re-issue ONE clean tool call.
    */
@@ -1216,6 +1327,103 @@ When asked about your identity, identify yourself as a coding assistant running 
     } catch {
       return false;
     }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Memória de sessão: auto-save, resumo e retomada (~/.groq/sessions/*.json)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  public getSessionId(): string {
+    return this.sessionId;
+  }
+
+  public getSessionTitle(): string {
+    return this.sessionTitle;
+  }
+
+  public setSessionTitle(title: string): void {
+    const clean = (title || '').replace(/\s+/g, ' ').trim().slice(0, 64);
+    if (!clean) throw new Error('O título não pode ser vazio');
+    this.sessionTitle = clean;
+    this.persistSession();
+  }
+
+  /** Resumo local (sem custo de API) do que aconteceu na sessão até agora. */
+  private buildSessionSummary(): string {
+    const userMsgs = this.messages
+      .filter(m => m.role === 'user' && !/SYSTEM REPAIR NOTE/.test(m.content))
+      .map(m => m.content.replace(/\s+/g, ' ').trim())
+      .filter(c => c.length > 0);
+    const steps = userMsgs.slice(-8).map(s => `- ${s.length > 110 ? s.slice(0, 107) + '…' : s}`);
+    const files = [...this.sessionFileLedger.keys()].slice(-6).map(p => `- ${p}`);
+    return [
+      steps.length ? 'Pedidos do usuário (cronologia):' : '',
+      ...steps,
+      files.length ? 'Arquivos trabalhados:' : '',
+      ...files,
+    ].filter(Boolean).join('\n');
+  }
+
+  public persistSession(): void {
+    try {
+      const userCount = this.messages.filter(m => m.role === 'user').length;
+      if (userCount === 0) return; // nada para salvar ainda
+      const session: SavedSession = {
+        id: this.sessionId,
+        title: this.sessionTitle || 'Sessão sem título',
+        model: this.model,
+        createdAt: this.sessionCreatedAt,
+        updatedAt: new Date().toISOString(),
+        messages: this.messages,
+        fileLedger: [...this.sessionFileLedger.entries()],
+        editLedger: [...this.editLedger],
+        summary: this.buildSessionSummary(),
+      };
+      saveSession(session);
+      debugLog('Session persisted:', { id: this.sessionId, title: session.title, messages: session.messages.length });
+    } catch (error) {
+      debugLog('Failed to persist session:', error);
+    }
+  }
+
+  /**
+   * Retoma uma conversa salva: restaura mensagens, modelo, ledger de arquivos
+   * e injeta uma nota de memória para o agente continuar o raciocínio de onde parou.
+   */
+  public resumeSession(query: string): { title: string; messageCount: number; model: string } | null {
+    const saved = findSessionByQuery(query);
+    if (!saved) return null;
+
+    // Volta para o modelo da sessão salva (sem alterar o padrão do usuário)
+    if (saved.model) this.setModel(saved.model, { persist: false });
+
+    const currentSystem = this.messages.filter(m => m.role === 'system');
+    const restored = saved.messages.filter(m => m.role !== 'system');
+
+    const memoryNote = [
+      `[SESSÃO RETOMADA] Conversa "${saved.title}" (última atividade: ${saved.updatedAt}).`,
+      saved.summary ? `Resumo do que já aconteceu:\n${saved.summary}` : '',
+      'Continue exatamente de onde a conversa parou.',
+    ].filter(Boolean).join('\n');
+
+    this.messages = [...currentSystem, { role: 'system', content: memoryNote }, ...restored];
+
+    this.sessionId = saved.id;
+    this.sessionTitle = saved.title;
+    this.sessionFileLedger = new Map(saved.fileLedger || []);
+    this.editLedger = [...(saved.editLedger || [])];
+    this.readResultCache.clear();
+    this.readCacheIndex.clear();
+
+    // Arquivos já lidos na sessão anterior → permite editar sem reler
+    try {
+      for (const p of this.sessionFileLedger.keys()) markFileAsRead(p);
+    } catch {
+      // best-effort
+    }
+
+    debugLog('Session resumed:', { id: saved.id, title: saved.title, restored: restored.length });
+    return { title: saved.title, messageCount: restored.length, model: this.model };
   }
 
   private async executeToolCall(toolCall: any): Promise<Record<string, any>> {
@@ -1289,7 +1497,22 @@ When asked about your identity, identify yourself as a coding assistant running 
       // For APPROVAL_REQUIRED_TOOLS, check if session auto-approval is enabled
       const canAutoApprove = requiresApproval && !isDangerous && this.sessionAutoApprove;
 
-      if (needsApproval && !canAutoApprove) {
+      // Memória de aprovação por arquivo: um arquivo aprovado 1x na sessão não pergunta de novo
+      const isFileEditTool = toolName === 'edit_file' || toolName === 'replace_lines' || toolName === 'create_file';
+      let fileAlreadyApproved = false;
+      if (isFileEditTool && toolArgs.file_path) {
+        try {
+          fileAlreadyApproved = this.approvedFiles.has(canonicalizePath(toolArgs.file_path));
+        } catch {
+          fileAlreadyApproved = false;
+        }
+      }
+
+      if (needsApproval && fileAlreadyApproved) {
+        this.notifyStatus(`🔁 ${toolName} aprovado automaticamente (arquivo já autorizado nesta sessão).`);
+      }
+
+      if (needsApproval && !canAutoApprove && !fileAlreadyApproved) {
         let approvalResult: { approved: boolean; autoApproveSession?: boolean };
 
         if (this.onToolApproval) {
@@ -1315,6 +1538,15 @@ When asked about your identity, identify yourself as a coding assistant running 
         } else {
           // No approval callback available, reject by default
           approvalResult = { approved: false };
+        }
+
+        // Registra aprovação por arquivo para o resto da sessão
+        if (approvalResult.approved && isFileEditTool && toolArgs.file_path) {
+          try {
+            this.approvedFiles.add(canonicalizePath(toolArgs.file_path));
+          } catch {
+            // best-effort
+          }
         }
 
         // Enable session auto-approval if requested (only for APPROVAL_REQUIRED_TOOLS)

@@ -4,7 +4,7 @@ export interface GroqModelOption {
   description: string;
   freeTierReady: boolean;
   supportsParallelTools: boolean;
-  reasoningEffort?: 'low' | 'none';
+  reasoningEffort?: 'low' | 'medium' | 'none';
 }
 
 export const DEFAULT_GROQ_MODEL = 'openai/gpt-oss-120b';
@@ -23,10 +23,10 @@ export const AVAILABLE_MODELS: GroqModelOption[] = [
   {
     id: 'openai/gpt-oss-120b',
     name: 'GPT OSS 120B (Padrão Recomendado · Free Tier)',
-    description: '120B parâmetros · Forte raciocínio em código · 8K TPM / 200K TPD grátis',
+    description: '120B parâmetros · Raciocínio médio (pensa mais antes de editar) · 8K TPM / 200K TPD grátis',
     freeTierReady: true,
     supportsParallelTools: false,
-    reasoningEffort: 'low',
+    reasoningEffort: 'medium',
   },
   {
     id: 'qwen/qwen3.8-27b',
@@ -67,7 +67,7 @@ export function supportsParallelToolCalls(modelId: string): boolean {
   return true;
 }
 
-export function getOptimalReasoningEffort(modelId: string): 'low' | 'none' | undefined {
+export function getOptimalReasoningEffort(modelId: string): 'low' | 'medium' | 'none' | undefined {
   const found = AVAILABLE_MODELS.find(m => m.id === modelId);
   if (found) return found.reasoningEffort;
   if (modelId.startsWith('openai/gpt-oss')) return 'low';

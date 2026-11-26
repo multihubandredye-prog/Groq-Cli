@@ -35,7 +35,8 @@ interface DiffPreviewProps {
 
 const MAX_DISPLAY_DIFF_LINES = 45;
 
-export default function DiffPreview({ toolName, toolArgs, isHistorical = false }: DiffPreviewProps) {
+function DiffPreview({ toolName, toolArgs, isHistorical = false }: DiffPreviewProps) {
+  const toolArgsJson = JSON.stringify(toolArgs);
   const [diffChunks, setDiffChunks] = React.useState<DiffChunk[]>([]);
   const [totalHiddenLines, setTotalHiddenLines] = React.useState(0);
   const [isLoading, setIsLoading] = React.useState(true);
@@ -43,7 +44,7 @@ export default function DiffPreview({ toolName, toolArgs, isHistorical = false }
 
   React.useEffect(() => {
     generateDiff();
-  }, [toolName, toolArgs]);
+  }, [toolName, toolArgsJson]);
 
   const generateDiff = async () => {
     try {
@@ -362,3 +363,6 @@ function parseDiffIntoChunks(diffLines: string[]): DiffChunk[] {
   if (currentChunk) chunks.push(currentChunk);
   return chunks;
 }
+
+// Memoização anti-flicker: re-renderiza apenas quando args/nome mudam de verdade
+export default React.memo(DiffPreview);
