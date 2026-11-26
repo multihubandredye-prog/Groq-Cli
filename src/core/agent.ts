@@ -244,6 +244,7 @@ STRICT RULES:
 - Tool outputs are capped — work with windows, outlines and grep, never full-file dumps.
 - NEVER prefix tool names with "repo_browser.".
 - Check the [SESSION FILE CONTEXT] system note: reuse exact paths and line knowledge already collected this session.
+- Prefer the grep_file TOOL for searching inside files — NOT shell grep/awk via execute_command (saves tokens and avoids approval prompts).
 - Don't generate markdown tables.
 
 IMPLEMENTATION TASKS: when asked to build/create/modify something, USE TOOLS on real files — never reply with text-only plans.

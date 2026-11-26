@@ -47,6 +47,10 @@ export function useAgent(
   const [showReasoning, setShowReasoning] = useState(true);
   const currentExecutionIdRef = useRef<string | null>(null);
   const streamingIdRef = useRef<string | null>(null);
+  // Throttle dos deltas de streaming: no máx. ~8 fps na UI — o texto completo é
+  // restaurado no finalize, então nada se perde; elimina repaint frenético!
+  const lastDeltaFlushRef = useRef(0);
+  const pendingDeltaRef = useRef<{ content: string; reasoning: string } | null>(null);
   const [pendingApproval, setPendingApproval] = useState<{
     toolName: string;
     toolArgs: Record<string, any>;
@@ -114,16 +118,23 @@ export function useAgent(
       // Set up tool execution callbacks
       agent.setToolCallbacks({
         onStreamDelta: (delta: { content: string; reasoning: string }) => {
-          // Streaming em tempo real: UMA única mensagem é atualizada com o texto acumulado
-          const hasText = (delta.content || '').length > 0 || (delta.reasoning || '').length > 0;
+          // Guarda o delta mais recente e aplica no máx. a cada 120ms
+          pendingDeltaRef.current = delta;
+          const now = Date.now();
+          if (now - lastDeltaFlushRef.current < 120) return;
+          lastDeltaFlushRef.current = now;
+          const d = pendingDeltaRef.current;
+          pendingDeltaRef.current = null;
+          if (!d) return;
+          const hasText = (d.content || '').length > 0 || (d.reasoning || '').length > 0;
           if (!hasText) return;
           if (streamingIdRef.current) {
-            updateMessage(streamingIdRef.current, { content: delta.content, reasoning: delta.reasoning || undefined });
+            updateMessage(streamingIdRef.current, { content: d.content, reasoning: d.reasoning || undefined });
           } else {
             streamingIdRef.current = addMessage({
               role: 'assistant',
-              content: delta.content || '',
-              reasoning: delta.reasoning || undefined,
+              content: d.content || '',
+              reasoning: d.reasoning || undefined,
             });
           }
         },

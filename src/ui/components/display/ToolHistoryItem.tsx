@@ -3,6 +3,25 @@ import { ToolExecution } from '../../hooks/useAgent.js';
 import DiffPreview from './DiffPreview.js';
 import { formatToolParams } from '../../../tools/tools.js';
 
+// Limita o output renderizado de qualquer ferramenta — outputs gigantes (grep com
+// dezenas de matches, builds longos) são a principal causa de repaint/scroll no Termux!
+const MAX_TOOL_OUTPUT_LINES = 12;
+
+function clipOutput(text: string, max: number = MAX_TOOL_OUTPUT_LINES): { text: string; hidden: number } {
+  const lines = text.split('\n');
+  if (lines.length <= max) return { text, hidden: 0 };
+  return { text: lines.slice(0, max).join('\n'), hidden: lines.length - max };
+}
+
+function HiddenNote({ hidden }: { hidden: number }) {
+  if (hidden <= 0) return null;
+  return (
+    <Text color="gray" dimColor>
+      … (+{hidden} linha{hidden > 1 ? 's' : ''} ocult{hidden > 1 ? 'as' : 'a'} — output completo no arquivo/seu editor)
+    </Text>
+  );
+}
+
 interface ToolHistoryItemProps {
   execution: ToolExecution;
 }
@@ -67,14 +86,20 @@ export default function ToolHistoryItem({ execution }: ToolHistoryItemProps) {
           stderrLines.push(line);
         }
       }
-      
+
+      const out = clipOutput(stdoutLines.join('\n'), 10);
+      const err = clipOutput(stderrLines.join('\n'), 4);
+
       return (
         <>
-          {stdoutLines.length > 0 && stdoutLines.some(line => line.trim()) && (
-            <Text color="white">{stdoutLines.join('\n').trimEnd()}</Text>
+          {out.text.trim() && (
+            <Text color="white">{out.text.trimEnd()}</Text>
           )}
-          {stderrLines.length > 0 && stderrLines.some(line => line.trim()) && (
-            <Text color="yellow">{stderrLines.join('\n').trimEnd()}</Text>
+          {err.text.trim() && (
+            <Text color="yellow">{err.text.trimEnd()}</Text>
+          )}
+          {(out.hidden > 0 || err.hidden > 0) && (
+            <HiddenNote hidden={out.hidden + err.hidden} />
           )}
         </>
       );
@@ -82,9 +107,12 @@ export default function ToolHistoryItem({ execution }: ToolHistoryItemProps) {
     
     // Handle directory tree output for list_files
     if (toolName === 'list_files') {
+      const raw = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+      const clipped = clipOutput(raw, 16);
       return (
         <Text color="cyan">
-          {typeof content === 'string' ? content : JSON.stringify(content, null, 2)}
+          {clipped.text}
+          {clipped.hidden > 0 ? `\n… (+${clipped.hidden} linhas ocultas)` : ''}
         </Text>
       );
     }
@@ -99,11 +127,14 @@ export default function ToolHistoryItem({ execution }: ToolHistoryItemProps) {
       return result?.message ? <Text color="gray">{result.message}</Text> : null;
     }
 
-    // Default handling
+    // Default handling — sempre limitado para não redesenhar tela gigante
+    const rawDefault = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+    const clippedDefault = clipOutput(rawDefault);
     return (
-      <Text color="white">
-        {typeof content === 'string' ? content : JSON.stringify(content, null, 2)}
-      </Text>
+      <Box flexDirection="column">
+        <Text color="white">{clippedDefault.text}</Text>
+        <HiddenNote hidden={clippedDefault.hidden} />
+      </Box>
     );
   };
 

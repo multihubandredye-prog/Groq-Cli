@@ -1,5 +1,5 @@
-import React, { useEffect, useRef } from 'react';
-import { Box, Text } from 'ink';
+import React, { useRef } from 'react';
+import { Box, Text, Static } from 'ink';
 import { ChatMessage } from '../../hooks/useAgent.js';
 import ToolHistoryItem from '../display/ToolHistoryItem.js';
 import Stats from '../display/Stats.js';
@@ -22,49 +22,65 @@ interface MessageHistoryProps {
   usageData?: Usage;
 }
 
-function MessageHistory({ messages, showReasoning = true, usageData }: MessageHistoryProps) {
-  const scrollRef = useRef<any>(null);
+// Janela de mensagens que permanecem dinâmicas (streaming + updates da última tool).
+// Tudo antes disso é impresso UMA ÚNICA VEZ via <Static> (scrollback nativo do terminal)
+// — elimina o repaint completo que fazia a tela do Termux subir e descer sem parar!
+const LIVE_WINDOW = 3;
+const REASONING_DISPLAY_CHARS = 420;
 
-  // Auto-scroll to bottom when new messages are added
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollToBottom?.();
-    }
-  }, [messages.length]);
+function MessageHistory({ messages, showReasoning = true, usageData }: MessageHistoryProps) {
+  // Contador de mensagens "seladas" — só cresce (append-only, exigência do <Static>)
+  const sealedCountRef = useRef(0);
+
+  if (sealedCountRef.current > messages.length) {
+    sealedCountRef.current = 0; // /clear ou sessão retomada → recomeça
+  }
+  const targetSealed = Math.max(0, messages.length - LIVE_WINDOW);
+  if (targetSealed > sealedCountRef.current) {
+    sealedCountRef.current = targetSealed;
+  }
+
+  const sealed = messages.slice(0, sealedCountRef.current);
+  const live = messages.slice(sealedCountRef.current);
 
   const formatTimestamp = (date: Date) => {
-    return date.toLocaleTimeString('en-US', { 
-      hour12: false, 
-      hour: '2-digit', 
-      minute: '2-digit' 
+    return date.toLocaleTimeString('en-US', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit'
     });
   };
 
   const renderMessage = (message: ChatMessage) => {
     const timestamp = formatTimestamp(message.timestamp);
-    
+
     switch (message.role) {
       case 'user':
         return (
           <Box key={message.id} marginBottom={1}>
-            <Text color="cyan" bold>{'>'} </Text>
+            <Text color="cyan" bold>{'> '} </Text>
             <Text color="gray">{message.content}</Text>
           </Box>
         );
-        
+
       case 'assistant':
         const markdownElements = parseMarkdown(message.content);
+        // Reasoning longo (medium effort) é cortado: mostra só a "cauda" do pensamento
+        const reasoningText = message.reasoning
+          ? message.reasoning.length > REASONING_DISPLAY_CHARS
+            ? '…' + message.reasoning.slice(-REASONING_DISPLAY_CHARS)
+            : message.reasoning
+          : undefined;
+
         return (
           <Box key={message.id} marginBottom={1} flexDirection="column">
-            {/* Render reasoning if present and showReasoning is enabled */}
-            {message.reasoning && showReasoning && (
+            {reasoningText && showReasoning && (
               <Box marginBottom={1}>
                 <Text italic dimColor>
-                  {message.reasoning}
+                  {reasoningText}
                 </Text>
               </Box>
             )}
-            {/* Render content only if it exists */}
             {message.content && markdownElements.map((element, index) => {
               switch (element.type) {
                 case 'code-block':
@@ -103,7 +119,7 @@ function MessageHistory({ messages, showReasoning = true, usageData }: MessageHi
             })}
           </Box>
         );
-        
+
       case 'system':
         // Handle special system message types
         if (message.type === 'stats') {
@@ -113,7 +129,7 @@ function MessageHistory({ messages, showReasoning = true, usageData }: MessageHi
             </Box>
           );
         }
-        
+
         // Subtle in-flow notices (model failover, context compaction, key rotation)
         if (message.type === 'notice') {
           return (
@@ -124,7 +140,7 @@ function MessageHistory({ messages, showReasoning = true, usageData }: MessageHi
             </Box>
           );
         }
-        
+
         return (
           <Box key={message.id} marginBottom={1}>
             <Text color="yellow" italic>
@@ -132,7 +148,7 @@ function MessageHistory({ messages, showReasoning = true, usageData }: MessageHi
             </Text>
           </Box>
         );
-        
+
       case 'tool_execution':
         if (message.toolExecution) {
           return (
@@ -146,7 +162,7 @@ function MessageHistory({ messages, showReasoning = true, usageData }: MessageHi
             <Text color="blue">Tool: {message.content}</Text>
           </Box>
         );
-        
+
       default:
         return (
           <Box key={message.id} marginBottom={1}>
@@ -159,7 +175,7 @@ function MessageHistory({ messages, showReasoning = true, usageData }: MessageHi
   };
 
   return (
-    <Box ref={scrollRef} flexDirection="column" flexGrow={1}>
+    <Box flexDirection="column" flexGrow={1}>
       {messages.length === 0 ? (
         <Box justifyContent="center" paddingY={2} flexDirection="column" alignItems="center">
           <Text color="gray" dimColor italic>
@@ -170,7 +186,24 @@ function MessageHistory({ messages, showReasoning = true, usageData }: MessageHi
           </Text>
         </Box>
       ) : (
-        messages.map(renderMessage)
+        <>
+          {/* Mensagens finalizadas: impressas uma única vez no scrollback do terminal.
+              Nunca são redesenhadas → ZERO flicker/scroll independente do tamanho da conversa. */}
+          <Static items={sealed}>
+            {(message: ChatMessage) => (
+              <Box key={message.id} paddingX={1}>
+                {renderMessage(message)}
+              </Box>
+            )}
+          </Static>
+
+          {/* Apenas as últimas mensagens (streaming/tool ativa) ficam dinâmicas */}
+          {live.map((message: ChatMessage) => (
+            <Box key={message.id} paddingX={1}>
+              {renderMessage(message)}
+            </Box>
+          ))}
+        </>
       )}
     </Box>
   );
