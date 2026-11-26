@@ -5,6 +5,7 @@ import { render } from 'ink';
 import React from 'react';
 import { Agent } from './agent.js';
 import App from '../ui/App.js';
+import { DEFAULT_GROQ_MODEL } from '../utils/models.js';
 
 const program = new Command();
 
@@ -46,7 +47,7 @@ async function startChat(
  ░░░░░░   ░░░░░░   ░░░░░░░░  ░░░░░░   
 `));
     
-  let defaultModel = 'moonshotai/kimi-k2-instruct';
+  let defaultModel = DEFAULT_GROQ_MODEL;
   
   // Validate proxy URL if provided
   if (proxy) {
@@ -73,8 +74,8 @@ async function startChat(
 
 program
   .name('groq')
-  .description('Groq Code CLI')
-  .version('1.0.2')
+  .description('Groq Code CLI — Free Tier Smart Edition (large files, auto model failover, smart paths)')
+  .version('1.5.0')
   .option('-t, --temperature <temperature>', 'Temperature for generation', parseFloat, 1.0)
   .option('-s, --system <message>', 'Custom system message')
   .option('-d, --debug', 'Enable debug logging to debug-agent.log in current directory')

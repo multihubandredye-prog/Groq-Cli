@@ -2,8 +2,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { writeFile, createDirectory, displayTree } from '../utils/file-ops.js';
-import { setReadFilesTracker } from './validators.js';
+import { writeFile, createDirectory, displayTree, resolveSmartPath, canonicalizePath } from '../utils/file-ops.js';
+import { buildFileOutline, grepInFileContent } from '../utils/code-intel.js';
+import { setReadFilesTracker, markFileAsRead } from './validators.js';
 
 const execAsync = promisify(exec);
 
@@ -29,55 +30,58 @@ interface Task {
   updated_at?: string;
 }
 
-// Global task state
 let currentTaskList: {
   user_query: string;
   tasks: Task[];
   created_at: string;
 } | null = null;
 
-// Track which files have been read in the current session
 const readFiles = new Set<string>();
 
-// Export readFiles for validator access
 export function getReadFilesTracker(): Set<string> {
   return readFiles;
 }
 
-// Initialize validator with readFiles tracker
 setReadFilesTracker(readFiles);
 
+const LARGE_FILE_LINE_THRESHOLD = 180;
+const MAX_LINES_PER_READ = 160;
+
 /**
- * Format key parameters for tool call display
+ * Format key parameters for tool call display in the Ink UI
  */
-export function formatToolParams(toolName: string, toolArgs: Record<string, any>, options: { includePrefix?: boolean; separator?: string } = {}): string {
+export function formatToolParams(
+  toolName: string,
+  toolArgs: Record<string, any>,
+  options: { includePrefix?: boolean; separator?: string } = {}
+): string {
   const { includePrefix = true, separator = '=' } = options;
-  
+
   const paramMappings: Record<string, string[]> = {
-    read_file: ['file_path'],
+    read_file: ['file_path', 'start_line', 'end_line'],
+    grep_file: ['file_path', 'pattern'],
     create_file: ['file_path'],
     edit_file: ['file_path'],
+    replace_lines: ['file_path', 'start_line', 'end_line'],
     delete_file: ['file_path'],
     list_files: ['directory'],
-    search_files: ['pattern'],
+    search_files: ['pattern', 'directory'],
     execute_command: ['command'],
     create_tasks: [],
     update_tasks: [],
   };
 
   const keyParams = paramMappings[toolName] || [];
-
   if (keyParams.length === 0) {
     return '';
   }
 
   const paramParts = keyParams
-    .filter(param => param in toolArgs)
+    .filter(param => param in toolArgs && toolArgs[param] !== undefined)
     .map(param => {
       let value = toolArgs[param];
-      // Truncate long values
-      if (typeof value === 'string' && value.length > 50) {
-        value = value.substring(0, 47) + '...';
+      if (typeof value === 'string' && value.length > 52) {
+        value = value.substring(0, 49) + '...';
       } else if (Array.isArray(value) && value.length > 3) {
         value = `[${value.length} items]`;
       }
@@ -92,10 +96,12 @@ export function formatToolParams(toolName: string, toolArgs: Record<string, any>
   return includePrefix ? `Parameters: ${formattedParams}` : formattedParams;
 }
 
-/**
- * Create a standardized tool response format
- */
-export function createToolResponse(success: boolean, data?: any, message: string = '', error: string = ''): ToolResult {
+export function createToolResponse(
+  success: boolean,
+  data?: any,
+  message: string = '',
+  error: string = ''
+): ToolResult {
   const response: ToolResult = { success };
 
   if (success) {
@@ -116,17 +122,23 @@ export function createToolResponse(success: boolean, data?: any, message: string
 }
 
 /**
- * Read the contents of a file, optionally specifying line range
+ * Read file contents safely:
+ * - Never dumps 4,000+ line files raw into LLM messages (prevents HTTP 413 Request Too Large!)
+ * - Automatically generates a structural outline + lines 1-90 when called without start_line on large files
+ * - Caps individual line slices to MAX_LINES_PER_READ (160 lines)
  */
-export async function readFile(filePath: string, startLine?: number, endLine?: number): Promise<ToolResult> {
+export async function readFile(
+  filePath: string,
+  startLine?: number,
+  endLine?: number
+): Promise<ToolResult> {
   try {
-    const resolvedPath = path.resolve(filePath);
+    const resolvedPath = resolveSmartPath(filePath);
 
-    // Check if file exists
     try {
       await fs.promises.access(resolvedPath);
     } catch {
-      return createToolResponse(false, undefined, '', 'Error: File not found');
+      return createToolResponse(false, undefined, '', `Error: File not found: ${filePath}`);
     }
 
     const stats = await fs.promises.stat(resolvedPath);
@@ -134,135 +146,306 @@ export async function readFile(filePath: string, startLine?: number, endLine?: n
       return createToolResponse(false, undefined, '', 'Error: Path is not a file');
     }
 
-    // Check file size (50MB limit)
     if (stats.size > 50 * 1024 * 1024) {
       return createToolResponse(false, undefined, '', 'Error: File too large (max 50MB)');
     }
 
     const content = await fs.promises.readFile(resolvedPath, 'utf-8');
-    const lines = content.split('\n');
+    const lines = content.split(/\r?\n/);
 
-    // Handle line range if specified
+    markFileAsRead(resolvedPath);
+
+    // Explicit line range requested
     if (startLine !== undefined) {
-      const startIdx = Math.max(0, startLine - 1); // Convert to 0-indexed
-      let endIdx = lines.length;
-
-      if (endLine !== undefined) {
-        endIdx = Math.min(lines.length, endLine);
-      }
-
+      const start = Math.max(1, Math.floor(startLine));
+      const startIdx = start - 1;
       if (startIdx >= lines.length) {
-        return createToolResponse(false, undefined, '', 'Error: Start line exceeds file length');
+        return createToolResponse(
+          false,
+          undefined,
+          '',
+          `Error: start_line (${start}) exceeds total lines (${lines.length})`
+        );
       }
 
-      const selectedLines = lines.slice(startIdx, endIdx);
-      const selectedContent = selectedLines.join('\n');
-      // Add file to read tracking for partial reads too
-      readFiles.add(resolvedPath);
-      const message = `Read lines ${startLine}-${endIdx} from ${filePath}`;
-
+      const requestedEnd = endLine !== undefined ? Math.floor(endLine) : start + MAX_LINES_PER_READ - 1;
+      const cappedEnd = Math.min(lines.length, Math.max(start, Math.min(requestedEnd, start + MAX_LINES_PER_READ - 1)));
+      const selectedContent = lines.slice(startIdx, cappedEnd).join('\n');
+      const truncatedNote =
+        endLine !== undefined && endLine > cappedEnd
+          ? ` (capped to ${MAX_LINES_PER_READ} lines; read ${cappedEnd + 1}..${endLine} next if needed)`
+          : '';
+      const message = `Read lines ${start}-${cappedEnd} of ${lines.length} from ${filePath}${truncatedNote}`;
       return createToolResponse(true, selectedContent, message);
-    } else {
-      // Add file to read tracking
-      readFiles.add(resolvedPath);
-      const message = `Read ${lines.length} lines from ${filePath}`;
-      return createToolResponse(true, content, message);
     }
 
+    // Large file without start_line -> return structural outline + lines 1..90!
+    if (lines.length > LARGE_FILE_LINE_THRESHOLD) {
+      const outline = buildFileOutline(content, resolvedPath);
+      const previewEnd = Math.min(90, lines.length);
+      const previewLines = lines.slice(0, previewEnd).join('\n');
+      const smartPayload =
+        `${outline}\n\n` +
+        `=== PREVIEW LINES 1-${previewEnd} OF ${lines.length} ===\n` +
+        `${previewLines}\n\n` +
+        `[NOTE: Large file (${lines.length} lines). Full dump omitted to fit token limits. ` +
+        `Use grep_file(file_path="${filePath}", pattern="...") to locate selectors/variables/buttons, ` +
+        `or read_file(file_path="${filePath}", start_line=..., end_line=...) to inspect specific ranges.]`;
+
+      return createToolResponse(
+        true,
+        smartPayload,
+        `Mapped outline + lines 1-${previewEnd} (of ${lines.length}) from ${filePath}`
+      );
+    }
+
+    const message = `Read ${lines.length} lines from ${filePath}`;
+    return createToolResponse(true, content, message);
   } catch (error) {
     if ((error as any).code === 'ENOENT') {
-      return createToolResponse(false, undefined, '', 'Error: File not found');
+      return createToolResponse(false, undefined, '', `Error: File not found: ${filePath}`);
     }
     return createToolResponse(false, undefined, '', 'Error: Failed to read file');
   }
 }
 
 /**
- * Create a new file or directory with specified content
+ * Search directly inside a single file (fast, works on external paths like /storage/emulated/0/Download/...)
  */
-export async function createFile(filePath: string, content: string, fileType: string = 'file', overwrite: boolean = false): Promise<ToolResult> {
+export async function grepFile(
+  filePath: string,
+  pattern: string,
+  isRegex: boolean = false,
+  contextLines: number = 2
+): Promise<ToolResult> {
   try {
-    const targetPath = path.resolve(filePath);
+    const resolvedPath = resolveSmartPath(filePath);
+    try {
+      await fs.promises.access(resolvedPath);
+    } catch {
+      return createToolResponse(false, undefined, '', `Error: File not found: ${filePath}`);
+    }
 
-    // Check if file exists and handle overwrite
+    const stats = await fs.promises.stat(resolvedPath);
+    if (!stats.isFile()) {
+      return createToolResponse(false, undefined, '', 'Error: Path is not a file');
+    }
+
+    const content = await fs.promises.readFile(resolvedPath, 'utf-8');
+    markFileAsRead(resolvedPath);
+
+    const { totalMatches, matches } = grepInFileContent(content, pattern, {
+      isRegex,
+      contextLines: Math.min(10, Math.max(0, contextLines ?? 2)),
+      maxMatches: 35,
+    });
+
+    if (totalMatches === 0) {
+      return createToolResponse(
+        true,
+        `No matches for "${pattern}" in ${filePath}.`,
+        `0 matches in ${path.basename(resolvedPath)}`
+      );
+    }
+
+    const formatted = matches.map(m => m.snippet).join('\n---\n');
+    const summaryMsg = `Found ${totalMatches} match(es) in ${path.basename(resolvedPath)}${totalMatches > matches.length ? ` (showing first ${matches.length})` : ''}`;
+    return createToolResponse(true, `${summaryMsg}:\n${formatted}`, summaryMsg);
+  } catch (error) {
+    return createToolResponse(false, undefined, '', `Error: grep_file failed - ${error}`);
+  }
+}
+
+export async function createFile(
+  filePath: string,
+  content: string,
+  fileType: string = 'file',
+  overwrite: boolean = false
+): Promise<ToolResult> {
+  try {
+    const targetPath = resolveSmartPath(filePath);
     const exists = await fs.promises.access(targetPath).then(() => true).catch(() => false);
     if (exists && !overwrite) {
-      return createToolResponse(false, undefined, '', 'Error: File already exists, use overwrite=true');
+      return createToolResponse(false, undefined, '', 'Error: File already exists, use edit_file, replace_lines, or overwrite=true');
     }
 
     if (fileType === 'directory') {
       const result = await createDirectory(targetPath);
       if (result) {
         return createToolResponse(true, { path: targetPath, type: 'directory' }, `Directory created: ${filePath}`);
-      } else {
-        return createToolResponse(false, undefined, '', 'Error: Failed to create directory');
       }
+      return createToolResponse(false, undefined, '', 'Error: Failed to create directory');
     } else if (fileType === 'file') {
       const result = await writeFile(targetPath, content, overwrite, true);
       if (result) {
+        markFileAsRead(targetPath);
         return createToolResponse(true, undefined, `File created: ${filePath}`);
-      } else {
-        return createToolResponse(false, undefined, '', 'Error: Failed to create file');
       }
-    } else {
-      return createToolResponse(false, undefined, '', "Error: Invalid file_type, must be 'file' or 'directory'");
+      return createToolResponse(false, undefined, '', 'Error: Failed to create file');
     }
-
+    return createToolResponse(false, undefined, '', "Error: Invalid file_type, must be 'file' or 'directory'");
   } catch (error) {
     return createToolResponse(false, undefined, '', 'Error: Failed to create file or directory');
   }
 }
 
+function stripAccidentalLineNumbers(snippet: string): string {
+  const lines = snippet.split('\n');
+  if (lines.length > 0 && lines.every(l => !l.trim() || /^(?:>\s*)?L?\d+:\s?/.test(l))) {
+    return lines.map(l => l.replace(/^(?:>\s*)?L?\d+:\s?/, '')).join('\n');
+  }
+  return snippet;
+}
+
 /**
- * Edit a file by replacing exact text strings
- * Note: Arguments are pre-validated by the validation system before this function is called
+ * Edit an existing file (supports single replacement OR batch `edits[]`, plus CRLF tolerance!)
  */
-export async function editFile(filePath: string, oldText: string, newText: string, replaceAll: boolean = false): Promise<ToolResult> {
+export async function editFile(
+  filePath: string,
+  oldText?: string,
+  newText?: string,
+  replaceAll: boolean = false,
+  edits?: Array<{ old_text: string; new_text: string; replace_all?: boolean }>
+): Promise<ToolResult> {
   try {
-    const resolvedPath = path.resolve(filePath);
-
-    // Read current content (validation already confirmed file exists and was read)
-    const originalContent = await fs.promises.readFile(resolvedPath, 'utf-8');
-
-    // Perform the replacement (validation already confirmed old_text exists and is unambiguous)
-    let updatedContent: string;
-    if (replaceAll) {
-      updatedContent = originalContent.split(oldText).join(newText);
-    } else {
-      updatedContent = originalContent.replace(oldText, newText);
+    const resolvedPath = resolveSmartPath(filePath);
+    const exists = await fs.promises.access(resolvedPath).then(() => true).catch(() => false);
+    if (!exists) {
+      return createToolResponse(false, undefined, '', `Error: File not found: ${filePath}`);
     }
 
-    // Write the updated content
-    const result = await writeFile(filePath, updatedContent, true, true);
+    const originalRaw = await fs.promises.readFile(resolvedPath, 'utf-8');
+    const usesCrlf = originalRaw.includes('\r\n');
+    let working = originalRaw.replace(/\r\n/g, '\n');
+
+    const editList: Array<{ old_text: string; new_text: string; replace_all?: boolean }> =
+      Array.isArray(edits) && edits.length > 0
+        ? edits
+        : oldText !== undefined && newText !== undefined
+          ? [{ old_text: oldText, new_text: newText, replace_all: replaceAll }]
+          : [];
+
+    if (editList.length === 0) {
+      return createToolResponse(
+        false,
+        undefined,
+        '',
+        'Error: Provide old_text & new_text, or a non-empty edits[] array.'
+      );
+    }
+
+    let totalReplacements = 0;
+
+    for (let idx = 0; idx < editList.length; idx++) {
+      const item = editList[idx];
+      let targetOld = String(item.old_text ?? '').replace(/\r\n/g, '\n');
+      let targetNew = String(item.new_text ?? '').replace(/\r\n/g, '\n');
+
+      if (!targetOld) {
+        return createToolResponse(false, undefined, '', `Error: old_text in edit #${idx + 1} cannot be empty`);
+      }
+
+      if (!working.includes(targetOld)) {
+        // Fallback if LLM accidentally copied L12: prefixes from grep_file
+        const strippedOld = stripAccidentalLineNumbers(targetOld);
+        if (strippedOld !== targetOld && working.includes(strippedOld)) {
+          targetOld = strippedOld;
+          targetNew = stripAccidentalLineNumbers(targetNew);
+        } else {
+          return createToolResponse(
+            false,
+            undefined,
+            '',
+            `Error: old_text not found in ${path.basename(resolvedPath)} (edit #${idx + 1}: "${targetOld.slice(0, 60).replace(/\n/g, '\\n')}..."). Re-read the exact lines or use replace_lines.`
+          );
+        }
+      }
+
+      const doAll = Boolean(item.replace_all ?? replaceAll);
+      if (doAll) {
+        const occurrences = working.split(targetOld).length - 1;
+        working = working.split(targetOld).join(targetNew);
+        totalReplacements += occurrences;
+      } else {
+        working = working.replace(targetOld, targetNew);
+        totalReplacements += 1;
+      }
+    }
+
+    const finalOut = usesCrlf ? working.replace(/\n/g, '\r\n') : working;
+    const result = await writeFile(resolvedPath, finalOut, true, true);
     if (result) {
-      const replacementCount = replaceAll ? 
-        (originalContent.split(oldText).length - 1) : 1;
-      return createToolResponse(true, undefined, `Replaced ${replacementCount} occurrence(s) in ${filePath}`);
-    } else {
-      return createToolResponse(false, undefined, '', 'Error: Failed to write changes to file');
+      markFileAsRead(resolvedPath);
+      return createToolResponse(
+        true,
+        undefined,
+        `Applied ${totalReplacements} replacement(s) in ${filePath}`
+      );
     }
-
+    return createToolResponse(false, undefined, '', 'Error: Failed to write changes to file');
   } catch (error) {
     return createToolResponse(false, undefined, '', `Error: Failed to edit file - ${error}`);
   }
 }
 
 /**
- * Delete a file or directory with safety checks
+ * Surgically replace lines [startLine..endLine] (1-indexed, inclusive)
  */
-export async function deleteFile(filePath: string, recursive: boolean = false): Promise<ToolResult> {
+export async function replaceLines(
+  filePath: string,
+  startLine: number,
+  endLine: number,
+  newContent: string
+): Promise<ToolResult> {
   try {
-    const targetPath = path.resolve(filePath);
-    const currentWorkingDir = path.resolve(process.cwd());
-
-    // Safety check 1: Never delete the root directory itself
-    if (targetPath === currentWorkingDir) {
-      return createToolResponse(false, undefined, '', 'Error: Cannot delete the root project directory');
+    const resolvedPath = resolveSmartPath(filePath);
+    const exists = await fs.promises.access(resolvedPath).then(() => true).catch(() => false);
+    if (!exists) {
+      return createToolResponse(false, undefined, '', `Error: File not found: ${filePath}`);
     }
 
-    // Safety check 2: Never delete anything outside the current working directory
-    if (!targetPath.startsWith(currentWorkingDir)) {
-      return createToolResponse(false, undefined, '', 'Error: Cannot delete files outside the project directory');
+    const raw = await fs.promises.readFile(resolvedPath, 'utf-8');
+    const usesCrlf = raw.includes('\r\n');
+    const lines = raw.replace(/\r\n/g, '\n').split('\n');
+
+    const s = Math.max(1, Math.floor(startLine));
+    const e = Math.min(lines.length, Math.floor(endLine));
+    if (s > e || s > lines.length) {
+      return createToolResponse(
+        false,
+        undefined,
+        '',
+        `Error: Invalid line range ${startLine}..${endLine} (file has ${lines.length} lines)`
+      );
+    }
+
+    const cleanNew = stripAccidentalLineNumbers(newContent.replace(/\r\n/g, '\n'));
+    const replacementLines = cleanNew === '' ? [] : cleanNew.split('\n');
+    lines.splice(s - 1, e - s + 1, ...replacementLines);
+
+    const updated = lines.join(usesCrlf ? '\r\n' : '\n');
+    const ok = await writeFile(resolvedPath, updated, true, true);
+    if (!ok) {
+      return createToolResponse(false, undefined, '', 'Error: Failed to write updated lines');
+    }
+    markFileAsRead(resolvedPath);
+    return createToolResponse(
+      true,
+      undefined,
+      `Replaced lines ${s}-${e} (${e - s + 1} -> ${replacementLines.length} lines) in ${filePath}`
+    );
+  } catch (error) {
+    return createToolResponse(false, undefined, '', `Error: replace_lines failed - ${error}`);
+  }
+}
+
+export async function deleteFile(filePath: string, recursive: boolean = false): Promise<ToolResult> {
+  try {
+    const targetPath = resolveSmartPath(filePath);
+    const currentWorkingDir = path.resolve(process.cwd());
+
+    if (targetPath === currentWorkingDir) {
+      return createToolResponse(false, undefined, '', 'Error: Cannot delete the root project directory');
     }
 
     const exists = await fs.promises.access(targetPath).then(() => true).catch(() => false);
@@ -272,38 +455,37 @@ export async function deleteFile(filePath: string, recursive: boolean = false): 
 
     const stats = await fs.promises.stat(targetPath);
     if (stats.isDirectory() && !recursive) {
-      // Check if directory is empty
       const items = await fs.promises.readdir(targetPath);
       if (items.length > 0) {
         return createToolResponse(false, undefined, '', 'Error: Directory not empty, use recursive=true');
       }
     }
 
-    // Perform deletion
     if (stats.isDirectory()) {
-      await fs.promises.rmdir(targetPath, { recursive });
+      await fs.promises.rm(targetPath, { recursive, force: true });
     } else {
       await fs.promises.unlink(targetPath);
     }
 
     const fileType = stats.isDirectory() ? 'directory' : 'file';
     return createToolResponse(true, undefined, `Deleted ${fileType}: ${filePath}`);
-
   } catch (error) {
     return createToolResponse(false, undefined, '', 'Error: Failed to delete');
   }
 }
 
-/**
- * List files and directories in a path with tree-style display
- */
-export async function listFiles(directory: string = '.', pattern: string = '*', recursive: boolean = false, showHidden: boolean = false): Promise<ToolResult> {
+export async function listFiles(
+  directory: string = '.',
+  pattern: string = '*',
+  recursive: boolean = false,
+  showHidden: boolean = false
+): Promise<ToolResult> {
   try {
-    const dirPath = path.resolve(directory);
+    const dirPath = resolveSmartPath(directory);
 
     const exists = await fs.promises.access(dirPath).then(() => true).catch(() => false);
     if (!exists) {
-      return createToolResponse(false, undefined, '', 'Error: Directory not found');
+      return createToolResponse(false, undefined, '', `Error: Directory not found: ${directory}`);
     }
 
     const stats = await fs.promises.stat(dirPath);
@@ -311,19 +493,13 @@ export async function listFiles(directory: string = '.', pattern: string = '*', 
       return createToolResponse(false, undefined, '', 'Error: Path is not a directory');
     }
 
-    // Get tree display output
-    const treeOutput = await displayTree(directory, pattern, recursive, showHidden);
-
+    const treeOutput = await displayTree(dirPath, pattern, recursive, showHidden);
     return createToolResponse(true, treeOutput, `Listed ${directory}`);
-
   } catch (error) {
     return createToolResponse(false, undefined, '', 'Error: Failed to list files');
   }
 }
 
-/**
- * Search for text patterns in files with advanced filtering and matching options
- */
 export async function searchFiles(
   pattern: string,
   filePattern: string = '*',
@@ -333,32 +509,34 @@ export async function searchFiles(
   fileTypes?: string[],
   excludeDirs?: string[],
   excludeFiles?: string[],
-  maxResults: number = 100,
+  maxResults: number = 30,
   contextLines: number = 0,
   groupByFile: boolean = false
 ): Promise<ToolResult> {
   try {
-    const searchDir = path.resolve(directory);
+    const searchDir = resolveSmartPath(directory);
 
-    // Check if directory exists
     const exists = await fs.promises.access(searchDir).then(() => true).catch(() => false);
     if (!exists) {
-      return createToolResponse(false, undefined, '', 'Error: Directory not found');
+      return createToolResponse(false, undefined, '', `Error: Path not found: ${directory}`);
     }
 
     const stats = await fs.promises.stat(searchDir);
+    // If LLM passed a file path to search_files, delegate directly to grepFile!
+    if (stats.isFile()) {
+      return grepFile(searchDir, pattern, patternType === 'regex', contextLines);
+    }
     if (!stats.isDirectory()) {
       return createToolResponse(false, undefined, '', 'Error: Path is not a directory');
     }
 
-    // Default exclusions
-    const defaultExcludeDirs = ['.git', 'node_modules', '.next', 'dist', 'build', '.cache'];
+    const cappedMax = Math.min(Math.max(1, maxResults || 30), 40);
+    const defaultExcludeDirs = ['.git', 'node_modules', '.next', 'dist', 'build', '.cache', 'Android'];
     const defaultExcludeFiles = ['*.log', '*.tmp', '*.cache', '*.lock'];
-    
+
     const finalExcludeDirs = [...defaultExcludeDirs, ...(excludeDirs || [])];
     const finalExcludeFiles = [...defaultExcludeFiles, ...(excludeFiles || [])];
 
-    // Prepare search regex
     let searchRegex: RegExp;
     try {
       switch (patternType) {
@@ -368,63 +546,68 @@ export async function searchFiles(
         case 'regex':
           searchRegex = new RegExp(pattern, caseSensitive ? 'g' : 'gi');
           break;
-        case 'fuzzy':
-          // Simple fuzzy search, insert .* between characters
+        case 'fuzzy': {
           const fuzzyPattern = pattern.split('').map(escapeRegex).join('.*');
           searchRegex = new RegExp(fuzzyPattern, caseSensitive ? 'g' : 'gi');
           break;
+        }
         case 'substring':
         default:
           searchRegex = new RegExp(escapeRegex(pattern), caseSensitive ? 'g' : 'gi');
           break;
       }
-    } catch (error) {
+    } catch {
       return createToolResponse(false, undefined, '', 'Error: Invalid regex pattern');
     }
 
-    // Collect all files to search
-    const filesToSearch = await collectFiles(searchDir, filePattern, fileTypes, finalExcludeDirs, finalExcludeFiles);
+    const filesToSearch = await collectFiles(
+      searchDir,
+      filePattern,
+      fileTypes,
+      finalExcludeDirs,
+      finalExcludeFiles
+    );
 
     if (filesToSearch.length === 0) {
       return createToolResponse(true, [], 'No files found matching criteria');
     }
 
-    // Search through files
     const results: SearchResult[] = [];
     let totalMatches = 0;
 
     for (const filePath of filesToSearch) {
-      if (totalMatches >= maxResults) {
-        break;
-      }
+      if (totalMatches >= cappedMax) break;
 
       try {
+        const fStat = await fs.promises.stat(filePath);
+        if (fStat.size > 2 * 1024 * 1024) continue; // skip huge >2MB blobs during folder scan
+
         const content = await fs.promises.readFile(filePath, 'utf-8');
-        const lines = content.split('\n');
+        const lines = content.split(/\r?\n/);
         const fileMatches: SearchMatch[] = [];
 
-        for (let i = 0; i < lines.length && totalMatches < maxResults; i++) {
+        for (let i = 0; i < lines.length && totalMatches < cappedMax; i++) {
           const line = lines[i];
           const matches = Array.from(line.matchAll(searchRegex));
 
           if (matches.length > 0) {
             const contextStart = Math.max(0, i - contextLines);
             const contextEnd = Math.min(lines.length - 1, i + contextLines);
-            
+
             const contextLinesArray: string[] = [];
             for (let j = contextStart; j <= contextEnd; j++) {
-              contextLinesArray.push(lines[j]);
+              contextLinesArray.push(lines[j].slice(0, 180));
             }
 
             fileMatches.push({
               lineNumber: i + 1,
-              lineContent: line,
+              lineContent: line.slice(0, 180),
               contextLines: contextLines > 0 ? contextLinesArray : undefined,
-              matchPositions: matches.map(match => ({
+              matchPositions: matches.slice(0, 5).map(match => ({
                 start: match.index || 0,
                 end: (match.index || 0) + match[0].length,
-                text: match[0]
-              }))
+                text: match[0].slice(0, 80),
+              })),
             });
 
             totalMatches++;
@@ -433,44 +616,34 @@ export async function searchFiles(
 
         if (fileMatches.length > 0) {
           results.push({
-            filePath: path.relative(process.cwd(), filePath),
+            filePath: filePath.startsWith(process.cwd()) ? path.relative(process.cwd(), filePath) : filePath,
             matches: fileMatches,
-            totalMatches: fileMatches.length
+            totalMatches: fileMatches.length,
           });
         }
-
-      } catch (error) {
-        // Skip files that can't be read (binary files, permission issues, etc.)
+      } catch {
         continue;
       }
     }
 
-    // Format results
-    let formattedResults: any;
-    if (groupByFile) {
-      formattedResults = results;
-    } else {
-      // Flatten results
-      formattedResults = results.flatMap(fileResult => 
-        fileResult.matches.map(match => ({
-          filePath: fileResult.filePath,
-          lineNumber: match.lineNumber,
-          lineContent: match.lineContent,
-          contextLines: match.contextLines,
-          matchPositions: match.matchPositions
-        }))
-      );
-    }
+    const formattedResults = groupByFile
+      ? results
+      : results.flatMap(fileResult =>
+          fileResult.matches.map(match => ({
+            filePath: fileResult.filePath,
+            lineNumber: match.lineNumber,
+            lineContent: match.lineContent,
+            contextLines: match.contextLines,
+          }))
+        );
 
     const message = `Found ${totalMatches} match(es) in ${results.length} file(s)`;
     return createToolResponse(true, formattedResults, message);
-
-  } catch (error) {
+  } catch {
     return createToolResponse(false, undefined, '', 'Error: Failed to search files');
   }
 }
 
-// Helper interfaces for search results
 interface SearchMatch {
   lineNumber: number;
   lineContent: string;
@@ -488,12 +661,10 @@ interface SearchResult {
   totalMatches: number;
 }
 
-// Helper function to escape regex special characters
 function escapeRegex(string: string): string {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Helper function to collect files based on patterns and filters
 async function collectFiles(
   directory: string,
   filePattern: string,
@@ -502,178 +673,158 @@ async function collectFiles(
   excludeFiles?: string[]
 ): Promise<string[]> {
   const files: string[] = [];
+  const visitedDirs = new Set<string>();
+  const MAX_FILES_COLLECTED = 400;
 
-  async function walkDirectory(dir: string): Promise<void> {
+  async function walkDirectory(dir: string, depth: number): Promise<void> {
+    if (depth > 6 || files.length >= MAX_FILES_COLLECTED) return;
+    const realDir = canonicalizePath(dir);
+    if (visitedDirs.has(realDir)) return;
+    visitedDirs.add(realDir);
+
     try {
       const entries = await fs.promises.readdir(dir, { withFileTypes: true });
 
       for (const entry of entries) {
+        if (files.length >= MAX_FILES_COLLECTED) break;
         const fullPath = path.join(dir, entry.name);
 
-        if (entry.isDirectory()) {
-          // Check if directory should be excluded
+        let isDir = entry.isDirectory();
+        let isFile = entry.isFile();
+        if (entry.isSymbolicLink()) {
+          try {
+            const st = await fs.promises.stat(fullPath);
+            isDir = st.isDirectory();
+            isFile = st.isFile();
+          } catch {
+            continue;
+          }
+        }
+
+        if (isDir) {
           if (excludeDirs && excludeDirs.some(pattern => matchesPattern(entry.name, pattern))) {
             continue;
           }
-          // Skip hidden directories unless explicitly included
           if (entry.name.startsWith('.') && !entry.name.match(/^\.(config|env)$/)) {
             continue;
           }
-          await walkDirectory(fullPath);
-        } else if (entry.isFile()) {
-          // Check file type filters
+          await walkDirectory(fullPath, depth + 1);
+        } else if (isFile) {
           if (fileTypes && fileTypes.length > 0) {
             const ext = path.extname(entry.name).slice(1);
-            if (!fileTypes.includes(ext)) {
-              continue;
-            }
+            if (!fileTypes.includes(ext)) continue;
           }
-
-          // Check file pattern
-          if (!matchesPattern(entry.name, filePattern)) {
-            continue;
-          }
-
-          // Check exclusions
+          if (!matchesPattern(entry.name, filePattern)) continue;
           if (excludeFiles && excludeFiles.some(pattern => matchesPattern(entry.name, pattern))) {
             continue;
           }
-
-          // Skip obviously binary files
-          if (isBinaryFile(entry.name)) {
-            continue;
-          }
-
+          if (isBinaryFile(entry.name)) continue;
           files.push(fullPath);
         }
       }
-    } catch (error) {
-      // Skip directories we can't read
+    } catch {
+      // ignore unreadable dirs
     }
   }
 
-  await walkDirectory(directory);
+  await walkDirectory(directory, 0);
   return files;
 }
 
-// Helper function to match glob-like patterns
 function matchesPattern(filename: string, pattern: string): boolean {
-  if (pattern === '*') return true;
-  
-  // Simple glob matching, convert * to .* and ? to .
+  if (!pattern || pattern === '*') return true;
   const regexPattern = pattern
     .replace(/\./g, '\\.')
     .replace(/\*/g, '.*')
     .replace(/\?/g, '.');
-  
   return new RegExp(`^${regexPattern}$`, 'i').test(filename);
 }
 
-// Helper function to detect binary files
 function isBinaryFile(filename: string): boolean {
   const binaryExtensions = [
     '.exe', '.dll', '.so', '.dylib', '.bin', '.obj', '.o', '.a', '.lib',
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg', '.webp',
-    '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm',
+    '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.opus', '.ogg', '.m4a', '.wav',
     '.zip', '.tar', '.gz', '.bz2', '.rar', '.7z',
-    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
   ];
-  
   const ext = path.extname(filename).toLowerCase();
   return binaryExtensions.includes(ext);
 }
 
-
-/**
- * Execute a shell command or run code
- */
-export async function executeCommand(command: string, commandType: string, workingDirectory?: string, timeout: number = 30000): Promise<ToolResult> {
+export async function executeCommand(
+  command: string,
+  commandType: string,
+  workingDirectory?: string,
+  timeout: number = 30000
+): Promise<ToolResult> {
   try {
-    // Validate command type
     if (!['bash', 'python', 'setup', 'run'].includes(commandType)) {
       return createToolResponse(false, undefined, '', 'Error: Invalid command_type');
     }
 
-    let originalCwd: string | undefined;
+    let cwdToUse = process.cwd();
     if (workingDirectory) {
-      const wdPath = path.resolve(workingDirectory);
+      const wdPath = resolveSmartPath(workingDirectory);
       const exists = await fs.promises.access(wdPath).then(() => true).catch(() => false);
       if (!exists) {
         return createToolResponse(false, undefined, '', 'Error: Working directory not found');
       }
-      originalCwd = process.cwd();
-      process.chdir(workingDirectory);
+      cwdToUse = wdPath;
     }
 
-    try {
-      let execCommand: string;
-      if (commandType === 'python') {
-        execCommand = `python -c "${command.replace(/"/g, '\\"')}"`;
-      } else {
-        execCommand = command;
-      }
+    const execCommand =
+      commandType === 'python'
+        ? `python3 -c "${command.replace(/"/g, '\\"')}"`
+        : command;
 
-      const { stdout, stderr } = await execAsync(execCommand, { timeout });
-      const success = true; // If no error was thrown, consider it successful
+    const { stdout, stderr } = await execAsync(execCommand, {
+      timeout,
+      cwd: cwdToUse,
+      maxBuffer: 2 * 1024 * 1024,
+    });
 
-      return createToolResponse(
-        success,
-        `stdout: ${stdout}\nstderr: ${stderr}`,
-        `Command executed successfully`
-      );
+    const trimmedStdout = stdout.length > 4000 ? stdout.slice(0, 4000) + '\n...[truncated]' : stdout;
+    const trimmedStderr = stderr.length > 2000 ? stderr.slice(0, 2000) + '\n...[truncated]' : stderr;
 
-    } finally {
-      // Restore original working directory
-      if (originalCwd) {
-        process.chdir(originalCwd);
-      }
-    }
-
+    return createToolResponse(
+      true,
+      `stdout: ${trimmedStdout}\nstderr: ${trimmedStderr}`,
+      'Command executed successfully'
+    );
   } catch (error: any) {
     const isTimeout = error.killed && error.signal === 'SIGTERM';
     if (isTimeout) {
       return createToolResponse(false, undefined, '', 'Error: Command timed out');
     }
-    return createToolResponse(false, undefined, '', 'Error: Failed to execute command');
+    const detail = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n').slice(0, 1500);
+    return createToolResponse(false, undefined, '', `Error: Command failed - ${detail}`);
   }
 }
 
-/**
- * Create a task list of subtasks to complete the user's request
- */
 export async function createTasks(userQuery: string, tasks: Task[]): Promise<ToolResult> {
   try {
-    // Validate task structure
     for (let i = 0; i < tasks.length; i++) {
       const task = tasks[i];
       if (!task.id || !task.description) {
         return createToolResponse(false, undefined, '', `Error: Task ${i} missing required fields (id, description)`);
       }
-
-      // Set default status if not provided
-      if (!task.status) {
-        task.status = 'pending';
-      }
-
-      // Validate status
+      if (!task.status) task.status = 'pending';
       if (!['pending', 'in_progress', 'completed'].includes(task.status)) {
         return createToolResponse(false, undefined, '', `Error: Invalid status '${task.status}' for task ${task.id}`);
       }
     }
 
-    // Store the task list globally
     currentTaskList = {
       user_query: userQuery,
-      tasks: tasks,
-      created_at: new Date().toISOString()
+      tasks,
+      created_at: new Date().toISOString(),
     };
 
-
-    // Return a deep copy to prevent mutation of historical displays
     const snapshot = {
       user_query: currentTaskList.user_query,
       tasks: currentTaskList.tasks.map(task => ({ ...task })),
-      created_at: currentTaskList.created_at
+      created_at: currentTaskList.created_at,
     };
 
     return createToolResponse(
@@ -681,22 +832,17 @@ export async function createTasks(userQuery: string, tasks: Task[]): Promise<Too
       snapshot,
       `Created task list with ${tasks.length} tasks for: ${userQuery}`
     );
-
   } catch (error) {
     return createToolResponse(false, undefined, '', `Error: Failed to create tasks - ${error}`);
   }
 }
 
-/**
- * Update the status of one or more tasks in the task list
- */
 export async function updateTasks(taskUpdates: TaskUpdate[]): Promise<ToolResult> {
   try {
     if (!currentTaskList) {
       return createToolResponse(false, undefined, '', 'Error: No task list exists. Create tasks first.');
     }
 
-    // Track updates made
     const updatesMade: Array<{
       id: string;
       description: string;
@@ -708,32 +854,22 @@ export async function updateTasks(taskUpdates: TaskUpdate[]): Promise<ToolResult
       if (!update.id || !update.status) {
         return createToolResponse(false, undefined, '', 'Error: Task update missing required fields (id, status)');
       }
-
-      // Validate status
       if (!['pending', 'in_progress', 'completed'].includes(update.status)) {
         return createToolResponse(false, undefined, '', `Error: Invalid status '${update.status}'`);
       }
 
-      // Find and update the task
       let taskFound = false;
       for (const task of currentTaskList.tasks) {
         if (task.id === update.id) {
           const oldStatus = task.status;
           task.status = update.status;
-
-          // Add notes if provided
-          if (update.notes) {
-            task.notes = update.notes;
-          }
-
-          // Add update timestamp
+          if (update.notes) task.notes = update.notes;
           task.updated_at = new Date().toISOString();
-
           updatesMade.push({
             id: update.id,
             description: task.description,
             old_status: oldStatus,
-            new_status: update.status
+            new_status: update.status,
           });
           taskFound = true;
           break;
@@ -745,29 +881,24 @@ export async function updateTasks(taskUpdates: TaskUpdate[]): Promise<ToolResult
       }
     }
 
-    // Return a deep copy to prevent mutation of historical displays
     const snapshot = {
       user_query: currentTaskList.user_query,
       tasks: currentTaskList.tasks.map(task => ({ ...task })),
-      created_at: currentTaskList.created_at
+      created_at: currentTaskList.created_at,
     };
 
-    return createToolResponse(
-      true,
-      snapshot,
-      `Updated ${updatesMade.length} task(s)`
-    );
-
+    return createToolResponse(true, snapshot, `Updated ${updatesMade.length} task(s)`);
   } catch (error) {
     return createToolResponse(false, undefined, '', `Error: Failed to update tasks - ${error}`);
   }
 }
 
-// Tool Registry: maps tool names to functions
 export const TOOL_REGISTRY = {
   read_file: readFile,
+  grep_file: grepFile,
   create_file: createFile,
   edit_file: editFile,
+  replace_lines: replaceLines,
   delete_file: deleteFile,
   list_files: listFiles,
   search_files: searchFiles,
@@ -776,31 +907,40 @@ export const TOOL_REGISTRY = {
   update_tasks: updateTasks,
 };
 
-/**
- * Execute a tool by name with given arguments
- */
 export async function executeTool(toolName: string, toolArgs: Record<string, any>): Promise<ToolResult> {
   if (!(toolName in TOOL_REGISTRY)) {
-    return createToolResponse(false, undefined, '', 'Error: Unknown tool');
+    return createToolResponse(false, undefined, '', `Error: Unknown tool "${toolName}"`);
   }
 
   try {
-    const toolFunction = (TOOL_REGISTRY as any)[toolName];
-    
-    // Call the function with the appropriate arguments based on the tool
     switch (toolName) {
       case 'read_file':
-        return await toolFunction(toolArgs.file_path, toolArgs.start_line, toolArgs.end_line);
+        return await readFile(toolArgs.file_path, toolArgs.start_line, toolArgs.end_line);
+      case 'grep_file':
+        return await grepFile(toolArgs.file_path, toolArgs.pattern, toolArgs.is_regex, toolArgs.context_lines);
       case 'create_file':
-        return await toolFunction(toolArgs.file_path, toolArgs.content, toolArgs.file_type, toolArgs.overwrite);
+        return await createFile(toolArgs.file_path, toolArgs.content, toolArgs.file_type, toolArgs.overwrite);
       case 'edit_file':
-        return await toolFunction(toolArgs.file_path, toolArgs.old_text, toolArgs.new_text, toolArgs.replace_all);
+        return await editFile(
+          toolArgs.file_path,
+          toolArgs.old_text,
+          toolArgs.new_text,
+          toolArgs.replace_all,
+          toolArgs.edits
+        );
+      case 'replace_lines':
+        return await replaceLines(
+          toolArgs.file_path,
+          toolArgs.start_line,
+          toolArgs.end_line,
+          toolArgs.new_content
+        );
       case 'delete_file':
-        return await toolFunction(toolArgs.file_path, toolArgs.recursive);
+        return await deleteFile(toolArgs.file_path, toolArgs.recursive);
       case 'list_files':
-        return await toolFunction(toolArgs.directory, toolArgs.pattern, toolArgs.recursive, toolArgs.show_hidden);
+        return await listFiles(toolArgs.directory, toolArgs.pattern, toolArgs.recursive, toolArgs.show_hidden);
       case 'search_files':
-        return await toolFunction(
+        return await searchFiles(
           toolArgs.pattern,
           toolArgs.file_pattern,
           toolArgs.directory,
@@ -814,11 +954,16 @@ export async function executeTool(toolName: string, toolArgs: Record<string, any
           toolArgs.group_by_file
         );
       case 'execute_command':
-        return await toolFunction(toolArgs.command, toolArgs.command_type, toolArgs.working_directory, toolArgs.timeout);
+        return await executeCommand(
+          toolArgs.command,
+          toolArgs.command_type,
+          toolArgs.working_directory,
+          toolArgs.timeout
+        );
       case 'create_tasks':
-        return await toolFunction(toolArgs.user_query, toolArgs.tasks);
+        return await createTasks(toolArgs.user_query, toolArgs.tasks);
       case 'update_tasks':
-        return await toolFunction(toolArgs.task_updates);
+        return await updateTasks(toolArgs.task_updates);
       default:
         return createToolResponse(false, undefined, '', 'Error: Tool not implemented');
     }
@@ -826,6 +971,6 @@ export async function executeTool(toolName: string, toolArgs: Record<string, any
     if (error instanceof TypeError) {
       return createToolResponse(false, undefined, '', 'Error: Invalid tool arguments');
     }
-    return createToolResponse(false, undefined, '', 'Error: Unexpected tool error');
+    return createToolResponse(false, undefined, '', `Error: Unexpected tool error - ${error}`);
   }
 }

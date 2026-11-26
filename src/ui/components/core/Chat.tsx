@@ -184,14 +184,11 @@ export default function Chat({ agent }: ChatProps) {
 
   const handleModelSelect = (model: string) => {
     setShowModelSelector(false);
-    // Clear chat history and session stats when switching models
-    clearHistory();
-    clearSessionStats();
-    // Set the new model on the agent
+    // Set the new model on the agent (chat history is preserved!)
     agent.setModel(model);
     addMessage({
       role: 'system',
-      content: `Switched to model: ${model}. Chat history has been cleared.`,
+      content: `✅ Modelo alterado para ${model}. O histórico da conversa foi mantido e o failover automático segue ativo.`,
     });
   };
 
@@ -199,7 +196,7 @@ export default function Chat({ agent }: ChatProps) {
     setShowModelSelector(false);
     addMessage({
       role: 'system',
-      content: 'Model selection canceled.',
+      content: 'Seleção de modelo cancelada.',
     });
   };
 
@@ -276,7 +273,7 @@ export default function Chat({ agent }: ChatProps) {
           />
         ) : (
           <Box>
-            <Text color="gray" dimColor>Processing...</Text>
+            <Text color="gray" dimColor>Processando...</Text>
           </Box>
         )}
       </Box>

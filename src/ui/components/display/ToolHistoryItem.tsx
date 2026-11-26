@@ -38,7 +38,7 @@ export default function ToolHistoryItem({ execution }: ToolHistoryItemProps) {
 
 
   const shouldShowDiff = (toolName: string) => {
-    return ['create_file', 'edit_file'].includes(toolName);
+    return ['create_file', 'edit_file', 'replace_lines'].includes(toolName);
   };
 
 
@@ -94,9 +94,9 @@ export default function ToolHistoryItem({ execution }: ToolHistoryItemProps) {
       return null;
     }
 
-    // Handle file content for search_files; don't show content
-    if (toolName === 'search_files') {
-      return null;
+    // Handle file content for search_files / grep_file; show only concise summary message
+    if (toolName === 'search_files' || toolName === 'grep_file') {
+      return result?.message ? <Text color="gray">{result.message}</Text> : null;
     }
 
     // Default handling

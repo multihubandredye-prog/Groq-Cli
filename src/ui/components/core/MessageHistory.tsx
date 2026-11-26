@@ -114,6 +114,17 @@ export default function MessageHistory({ messages, showReasoning = true, usageDa
           );
         }
         
+        // Subtle in-flow notices (model failover, context compaction, key rotation)
+        if (message.type === 'notice') {
+          return (
+            <Box key={message.id} marginBottom={1}>
+              <Text color="cyan" dimColor italic>
+                {message.content}
+              </Text>
+            </Box>
+          );
+        }
+        
         return (
           <Box key={message.id} marginBottom={1}>
             <Text color="yellow" italic>

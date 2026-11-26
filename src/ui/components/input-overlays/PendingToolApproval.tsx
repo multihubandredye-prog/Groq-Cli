@@ -78,7 +78,7 @@ export default function PendingToolApproval({
       })()} 
       
       {/* Show diff for file operations in yellow bordered box */}
-      {(toolName === 'create_file' || toolName === 'edit_file') && (
+      {(toolName === 'create_file' || toolName === 'edit_file' || toolName === 'replace_lines') && (
         <Box borderStyle="round" borderColor="yellow" paddingX={1}>
           <DiffPreview 
             toolName={toolName}

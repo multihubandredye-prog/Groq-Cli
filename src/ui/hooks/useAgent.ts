@@ -146,10 +146,10 @@ export function useAgent(
                 return { 
                 ...msg, 
                 content: result.userRejected 
-                  ? `🚫 ${name} rejected by user`
+                  ? `🚫 ${name} rejeitado pelo usuário`
                   : result.success 
-                    ? `✓ ${name} completed successfully` 
-                    : `🔴 ${name} failed: ${result.error || 'Unknown error'}`,
+                    ? `✓ ${name} concluído`
+                    : `🔴 ${name} falhou: ${result.error || 'Erro desconhecido'}`,
                 toolExecution: { 
                   ...msg.toolExecution!, 
                   status: result.userRejected 
@@ -195,8 +195,8 @@ export function useAgent(
                   return prev.map(msg => {
                     if (msg.toolExecution?.id === currentExecutionIdRef.current && msg.role === 'tool_execution') {
                       const messageContent = approvalResult.approved 
-                        ? `Executing ${toolName}...${approvalResult.autoApproveSession ? ' (Auto-approval enabled for session)' : ''}` 
-                        : `Tool ${toolName} rejected by user`;
+                        ? `Executando ${toolName}...${approvalResult.autoApproveSession ? ' (Aprovação automática ativada para a sessão)' : ''}` 
+                        : `Ferramenta ${toolName} rejeitada pelo usuário`;
                       
                       return { 
                         ...msg, 
@@ -250,7 +250,6 @@ export function useAgent(
             setPendingError({
               error,
               resolve: (shouldRetry: boolean) => {
-                
                 // Resume metrics after decision
                 if (onResumeRequest) {
                   onResumeRequest();
@@ -259,6 +258,14 @@ export function useAgent(
                 resolve(shouldRetry);
               }
             });
+          });
+        },
+        onStatus: (message: string) => {
+          // Subtle in-flow notifications (model failover, compaction, key rotation...)
+          addMessage({
+            role: 'system',
+            content: message,
+            type: 'notice',
           });
         },
       });

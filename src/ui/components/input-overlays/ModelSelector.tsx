@@ -1,21 +1,12 @@
 import React, { useState } from 'react';
 import { Box, Text, useInput } from 'ink';
+import { AVAILABLE_MODELS } from '../../../utils/models.js';
 
 interface ModelSelectorProps {
   onSubmit: (model: string) => void;
   onCancel: () => void;
   currentModel?: string;
 }
-
-const AVAILABLE_MODELS = [
-  { id: 'moonshotai/kimi-k2-instruct-0905', name: 'Kimi K2 Instruct 09-05', description: 'Enhanced coding capabilities' },
-  { id: 'openai/gpt-oss-120b', name: 'GPT OSS 120B', description: 'Fast, capable, and cheap model' },
-  { id: 'openai/gpt-oss-20b', name: 'GPT OSS 20B', description: 'Fastest and cheapest model' },
-  { id: 'qwen/qwen3-32b', name: 'Qwen 3 32B', description: '' },
-  { id: 'meta-llama/llama-4-maverick-17b-128e-instruct', name: 'Llama 4 Maverick', description: '' },
-  { id: 'meta-llama/llama-4-scout-17b-16e-instruct', name: 'Llama 4 Scout', description: '' },
-
-];
 
 export default function ModelSelector({ onSubmit, onCancel, currentModel }: ModelSelectorProps) {
   const [selectedIndex, setSelectedIndex] = useState(() => {
@@ -53,35 +44,29 @@ export default function ModelSelector({ onSubmit, onCancel, currentModel }: Mode
   return (
     <Box flexDirection="column">
       <Box marginBottom={1}>
-        <Text color="cyan" bold>Select Model</Text>
-      </Box>
-      
-      <Box marginBottom={1}>
-        <Text color="gray" dimColor>
-          Choose a model for your conversation. The chat will be cleared when you switch models.
-        </Text>
+        <Text color="cyan" bold>Select Groq Model (Auto-Failover Enabled)</Text>
       </Box>
 
       <Box marginBottom={1}>
         <Text color="gray" dimColor>
-          Visit <Text underline>https://groq.com/pricing</Text> for more information.
+          When a model hits its rate limit (TPM/TPD), Groq-CLI automatically switches to the next available model without losing your conversation!
         </Text>
       </Box>
 
       <Box flexDirection="column" marginBottom={1}>
         {AVAILABLE_MODELS.map((model, index) => (
-          <Box key={model.id} marginBottom={index === AVAILABLE_MODELS.length - 1 ? 0 : 1}>
-            <Text 
+          <Box key={model.id} flexDirection="column" marginBottom={index === AVAILABLE_MODELS.length - 1 ? 0 : 1}>
+            <Text
               color={index === selectedIndex ? 'black' : 'white'}
               backgroundColor={index === selectedIndex ? 'cyan' : undefined}
               bold={index === selectedIndex}
             >
-              {index === selectedIndex ? <Text bold>{">"}</Text> : "  "} {""}
+              {index === selectedIndex ? <Text bold>{'>'}</Text> : '  '}{' '}
               {model.name}
               {model.id === currentModel ? ' (current)' : ''}
             </Text>
-            {index === selectedIndex && (
-              <Box marginLeft={4} marginTop={0}>
+            {index === selectedIndex && model.description && (
+              <Box marginLeft={4}>
                 <Text color="gray" dimColor>
                   {model.description}
                 </Text>

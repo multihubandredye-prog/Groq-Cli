@@ -1,18 +1,28 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import * as fs from 'fs';
-import * as path from 'path';
 import { validateReadBeforeEdit, getReadBeforeEditError } from '../../../tools/validators.js';
+import { resolveSmartPath } from '../../../utils/file-ops.js';
 
 interface DiffChunk {
   header: string;
   lines: string[];
 }
 
+interface EditEntry {
+  old_text: string;
+  new_text: string;
+  replace_all?: boolean;
+}
+
 interface ToolArgs {
   old_text?: string;
   new_text?: string;
   replace_all?: boolean;
+  edits?: EditEntry[];
+  start_line?: number;
+  end_line?: number;
+  new_content?: string;
   content?: string;
   file_path?: string;
 }
@@ -23,8 +33,11 @@ interface DiffPreviewProps {
   isHistorical?: boolean;
 }
 
+const MAX_DISPLAY_DIFF_LINES = 45;
+
 export default function DiffPreview({ toolName, toolArgs, isHistorical = false }: DiffPreviewProps) {
   const [diffChunks, setDiffChunks] = React.useState<DiffChunk[]>([]);
+  const [totalHiddenLines, setTotalHiddenLines] = React.useState(0);
   const [isLoading, setIsLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
 
@@ -36,9 +49,9 @@ export default function DiffPreview({ toolName, toolArgs, isHistorical = false }
     try {
       setIsLoading(true);
       setError(null);
+      setTotalHiddenLines(0);
 
-      // Check read-before-edit for edit tools (skip for historical edits)
-      if (!isHistorical && toolName === 'edit_file' && toolArgs.file_path) {
+      if (!isHistorical && (toolName === 'edit_file' || toolName === 'replace_lines') && toolArgs.file_path) {
         if (!validateReadBeforeEdit(toolArgs.file_path)) {
           setError(getReadBeforeEditError(toolArgs.file_path));
           return;
@@ -51,89 +64,108 @@ export default function DiffPreview({ toolName, toolArgs, isHistorical = false }
         return;
       }
 
-      let reconstructedOriginal: string;
-      let simulatedContent: string;
-      
+      let reconstructedOriginal = '';
+      let simulatedContent = '';
+
       if (isHistorical) {
-        // For historical edits, generate synthetic diff directly from parameters
-        if (toolArgs.old_text !== undefined && toolArgs.new_text !== undefined) {
-          // edit_file operation
+        if (Array.isArray(toolArgs.edits) && toolArgs.edits.length > 0) {
+          reconstructedOriginal = toolArgs.edits.map(e => e.old_text).join('\n...\n');
+          simulatedContent = toolArgs.edits.map(e => e.new_text).join('\n...\n');
+        } else if (toolArgs.old_text !== undefined && toolArgs.new_text !== undefined) {
           reconstructedOriginal = toolArgs.old_text;
           simulatedContent = toolArgs.new_text;
+        } else if (toolName === 'replace_lines' && toolArgs.new_content !== undefined) {
+          reconstructedOriginal = `[Lines ${toolArgs.start_line}-${toolArgs.end_line}]`;
+          simulatedContent = toolArgs.new_content;
         } else if (toolArgs.content !== undefined) {
-          // create_file operation, show as adding all content
           reconstructedOriginal = '';
           simulatedContent = toolArgs.content;
-        } else {
-          // Fallback
-          reconstructedOriginal = '';
-          simulatedContent = '';
         }
       } else {
-        // For non-historical edits, use the existing file-based logic
         let originalContent = '';
-        
-        // Read current file content
         try {
-          const resolvedPath = path.resolve(filePath);
-          originalContent = await fs.promises.readFile(resolvedPath, 'utf-8');
-        } catch (error) {
-          // File doesn't exist or can't be read, use empty content
+          const resolvedPath = resolveSmartPath(filePath);
+          const raw = await fs.promises.readFile(resolvedPath, 'utf-8');
+          originalContent = raw.replace(/\r\n/g, '\n');
+        } catch {
+          originalContent = '';
         }
-        
+
         reconstructedOriginal = originalContent;
-        
-        // Handle different operation types
-        if (toolArgs.old_text !== undefined && toolArgs.new_text !== undefined) {
-          // String-based edit_file operation
-          if (!originalContent.includes(toolArgs.old_text)) {
-            // If old_text not found, the edit may have already been applied
-            // Try to reconstruct the original by reversing the edit
-            if (originalContent.includes(toolArgs.new_text)) {
-              if (toolArgs.replace_all) {
-                reconstructedOriginal = originalContent.split(toolArgs.new_text).join(toolArgs.old_text);
-              } else {
-                reconstructedOriginal = originalContent.replace(toolArgs.new_text, toolArgs.old_text);
-              }
-              simulatedContent = originalContent; // Current content is the result
-            } else {
-              // Neither old nor new text found, show as no changes
-              simulatedContent = originalContent;
-            }
-          } else {
-            // old_text found, apply the edit normally
-            if (toolArgs.replace_all) {
-              simulatedContent = originalContent.split(toolArgs.old_text).join(toolArgs.new_text);
-            } else {
-              simulatedContent = originalContent.replace(toolArgs.old_text, toolArgs.new_text);
+
+        if (toolName === 'replace_lines' && toolArgs.start_line && toolArgs.end_line) {
+          const lines = originalContent.split('\n');
+          const s = Math.max(1, Math.floor(toolArgs.start_line));
+          const e = Math.min(lines.length, Math.floor(toolArgs.end_line));
+          const newLines = (toolArgs.new_content ?? '').replace(/\r\n/g, '\n').split('\n');
+          const copy = [...lines];
+          if (s <= e && s <= copy.length) {
+            copy.splice(s - 1, e - s + 1, ...newLines);
+          }
+          simulatedContent = copy.join('\n');
+        } else if (Array.isArray(toolArgs.edits) && toolArgs.edits.length > 0) {
+          let working = originalContent;
+          for (const ed of toolArgs.edits) {
+            const o = (ed.old_text || '').replace(/\r\n/g, '\n');
+            const n = (ed.new_text || '').replace(/\r\n/g, '\n');
+            if (o && working.includes(o)) {
+              working = ed.replace_all ? working.split(o).join(n) : working.replace(o, n);
             }
           }
+          simulatedContent = working;
+        } else if (toolArgs.old_text !== undefined && toolArgs.new_text !== undefined) {
+          const o = toolArgs.old_text.replace(/\r\n/g, '\n');
+          const n = toolArgs.new_text.replace(/\r\n/g, '\n');
+          if (originalContent.includes(o)) {
+            simulatedContent = toolArgs.replace_all
+              ? originalContent.split(o).join(n)
+              : originalContent.replace(o, n);
+          } else {
+            simulatedContent = originalContent;
+          }
         } else {
-          // For create_file or other operations, treat as full content replacement
-          simulatedContent = toolArgs.content || '';
+          simulatedContent = (toolArgs.content || '').replace(/\r\n/g, '\n');
         }
       }
-      
-      // Generate unified diff
-      const reconstructedOriginalLines = reconstructedOriginal.split('\n');
-      const simulatedLines = simulatedContent.split('\n');
-      const diff = generateUnifiedDiff(
-        reconstructedOriginalLines,
-        simulatedLines,
+
+      const origLines = reconstructedOriginal ? reconstructedOriginal.split('\n') : [];
+      const simLines = simulatedContent ? simulatedContent.split('\n') : [];
+
+      const diff = generateFastUnifiedDiff(
+        origLines,
+        simLines,
         `${filePath} (original)`,
         `${filePath} (new)`,
-        5 // 5 lines of context
+        3
       );
-      
+
       if (diff.length === 0) {
         setDiffChunks([]);
         return;
       }
-      
-      // Parse diff into chunks for intelligent rendering
-      const chunks = parseDiffIntoChunks(diff);
-      setDiffChunks(chunks);
 
+      const chunks = parseDiffIntoChunks(diff);
+      // Cap total rendered lines so mobile Termux screens always keep approval options visible!
+      let count = 0;
+      let hidden = 0;
+      const cappedChunks: DiffChunk[] = [];
+      for (const ch of chunks) {
+        if (count >= MAX_DISPLAY_DIFF_LINES) {
+          hidden += ch.lines.length;
+          continue;
+        }
+        const room = MAX_DISPLAY_DIFF_LINES - count;
+        if (ch.lines.length <= room) {
+          cappedChunks.push(ch);
+          count += ch.lines.length;
+        } else {
+          cappedChunks.push({ header: ch.header, lines: ch.lines.slice(0, room) });
+          hidden += ch.lines.length - room;
+          count += room;
+        }
+      }
+      setTotalHiddenLines(hidden);
+      setDiffChunks(cappedChunks);
     } catch (err) {
       setError(`Error generating diff: ${err}`);
     } finally {
@@ -142,43 +174,43 @@ export default function DiffPreview({ toolName, toolArgs, isHistorical = false }
   };
 
   const renderDiffLine = (line: string, index: number) => {
-    if (line.startsWith('+++') || line.startsWith('---')) {
+    const clipped = line.length > 120 ? line.slice(0, 117) + '...' : line;
+    if (clipped.startsWith('+++') || clipped.startsWith('---')) {
       return (
         <Text key={index} bold color="blue">
-          {line}
+          {clipped}
         </Text>
       );
-    } else if (line.startsWith('@@')) {
+    } else if (clipped.startsWith('@@')) {
       return (
         <Text key={index} color="cyan">
-          {line}
+          {clipped}
         </Text>
       );
-    } else if (line.startsWith('+')) {
+    } else if (clipped.startsWith('+')) {
       return (
         <Text key={index} backgroundColor="rgb(124, 214, 114)" color="black">
-          + {line.slice(1)}
+          + {clipped.slice(1)}
         </Text>
       );
-    } else if (line.startsWith('-')) {
+    } else if (clipped.startsWith('-')) {
       return (
         <Text key={index} backgroundColor="rgb(214, 114, 114)" color="black">
-          - {line.slice(1)}
+          - {clipped.slice(1)}
         </Text>
       );
-    } else if (line.startsWith(' ')) {
+    } else if (clipped.startsWith(' ')) {
       return (
         <Text key={index} dimColor>
-          {'  ' + line.slice(1)}
-        </Text>
-      );
-    } else {
-      return (
-        <Text key={index} dimColor>
-          {line}
+          {'  ' + clipped.slice(1)}
         </Text>
       );
     }
+    return (
+      <Text key={index} dimColor>
+        {clipped}
+      </Text>
+    );
   };
 
   if (isLoading) {
@@ -210,189 +242,123 @@ export default function DiffPreview({ toolName, toolArgs, isHistorical = false }
       <Text bold color="cyan">Diff Preview:</Text>
       {diffChunks.map((chunk, chunkIndex) => (
         <Box key={chunkIndex} flexDirection="column" marginTop={chunkIndex > 0 ? 1 : 0}>
-          {chunkIndex > 0 && (
-            <Text dimColor>...</Text>
-          )}
+          {chunkIndex > 0 && <Text dimColor>...</Text>}
           {chunk.lines.map((line, lineIndex) => renderDiffLine(line, lineIndex))}
         </Box>
       ))}
+      {totalHiddenLines > 0 && (
+        <Text dimColor>... (+{totalHiddenLines} more diff lines)</Text>
+      )}
     </Box>
   );
 }
 
 /**
- * Generate a unified diff between two sets of lines
+ * Fast O(Delta) Unified Diff:
+ * Strips identical prefix & suffix lines BEFORE running LCS so 5,000+ line HTML/JS files
+ * render diffs in < 1ms instead of freezing Termux with a 25M-cell matrix!
  */
-// LCS-based diff algorithm for proper change detection
-function computeLCS(a: string[], b: string[]): number[][] {
-  const m = a.length;
-  const n = b.length;
-  const lcs = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
-  
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      if (a[i - 1] === b[j - 1]) {
-        lcs[i][j] = lcs[i - 1][j - 1] + 1;
-      } else {
-        lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
-      }
-    }
-  }
-  
-  return lcs;
-}
-
-function generateUnifiedDiff(
+function generateFastUnifiedDiff(
   originalLines: string[],
   newLines: string[],
   fromFile: string,
   toFile: string,
   context: number = 3
 ): string[] {
-  const result: string[] = [];
-  
-  if (originalLines.join('\n') === newLines.join('\n')) {
-    return result;
+  let prefix = 0;
+  const minLen = Math.min(originalLines.length, newLines.length);
+  while (prefix < minLen && originalLines[prefix] === newLines[prefix]) {
+    prefix++;
   }
-  
-  // Compute LCS to find actual changes
-  const lcs = computeLCS(originalLines, newLines);
-  
-  // Generate diff operations
-  const operations: Array<{type: 'equal' | 'delete' | 'insert', oldLine?: string, newLine?: string, oldIndex?: number, newIndex?: number}> = [];
-  
-  let i = originalLines.length;
-  let j = newLines.length;
-  
+
+  if (prefix === originalLines.length && prefix === newLines.length) {
+    return [];
+  }
+
+  let origEnd = originalLines.length - 1;
+  let newEnd = newLines.length - 1;
+  while (origEnd >= prefix && newEnd >= prefix && originalLines[origEnd] === newLines[newEnd]) {
+    origEnd--;
+    newEnd--;
+  }
+
+  const ctxStart = Math.max(0, prefix - context);
+  const origCtxEnd = Math.min(originalLines.length - 1, origEnd + context);
+  const newCtxEnd = Math.min(newLines.length - 1, newEnd + context);
+
+  const subOrig = originalLines.slice(ctxStart, origCtxEnd + 1);
+  const subNew = newLines.slice(ctxStart, newCtxEnd + 1);
+
+  // If delta window is still huge (e.g. creating a 2,000-line file), build linear hunk without quadratic LCS
+  if (subOrig.length * subNew.length > 120_000) {
+    const out: string[] = [
+      `--- ${fromFile}`,
+      `+++ ${toFile}`,
+      `@@ -${ctxStart + 1},${subOrig.length} +${ctxStart + 1},${subNew.length} @@`,
+    ];
+    for (const l of subOrig.slice(0, 25)) out.push(`-${l}`);
+    if (subOrig.length > 25) out.push(` ... (${subOrig.length - 25} removed lines omitted)`);
+    for (const l of subNew.slice(0, 25)) out.push(`+${l}`);
+    if (subNew.length > 25) out.push(` ... (${subNew.length - 25} added lines omitted)`);
+    return out;
+  }
+
+  const m = subOrig.length;
+  const n = subNew.length;
+  const lcs: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (subOrig[i - 1] === subNew[j - 1]) {
+        lcs[i][j] = lcs[i - 1][j - 1] + 1;
+      } else {
+        lcs[i][j] = Math.max(lcs[i - 1][j], lcs[i][j - 1]);
+      }
+    }
+  }
+
+  const ops: Array<{ type: 'equal' | 'delete' | 'insert'; line: string; origIdx: number; newIdx: number }> = [];
+  let i = m;
+  let j = n;
   while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && originalLines[i - 1] === newLines[j - 1]) {
-      operations.unshift({type: 'equal', oldLine: originalLines[i - 1], newLine: newLines[j - 1], oldIndex: i - 1, newIndex: j - 1});
+    if (i > 0 && j > 0 && subOrig[i - 1] === subNew[j - 1]) {
+      ops.unshift({ type: 'equal', line: subOrig[i - 1], origIdx: ctxStart + i, newIdx: ctxStart + j });
       i--;
       j--;
     } else if (j > 0 && (i === 0 || lcs[i][j - 1] >= lcs[i - 1][j])) {
-      operations.unshift({type: 'insert', newLine: newLines[j - 1], newIndex: j - 1});
+      ops.unshift({ type: 'insert', line: subNew[j - 1], origIdx: ctxStart + i, newIdx: ctxStart + j });
       j--;
-    } else if (i > 0 && (j === 0 || lcs[i][j - 1] < lcs[i - 1][j])) {
-      operations.unshift({type: 'delete', oldLine: originalLines[i - 1], oldIndex: i - 1});
+    } else {
+      ops.unshift({ type: 'delete', line: subOrig[i - 1], origIdx: ctxStart + i, newIdx: ctxStart + j });
       i--;
     }
   }
-  
-  // Group operations into hunks with context
-  const hunks: Array<{
-    oldStart: number, oldCount: number, newStart: number, newCount: number,
-    operations: typeof operations
-  }> = [];
-  
-  let currentHunk: typeof hunks[0] | null = null;
-  
-  for (let k = 0; k < operations.length; k++) {
-    const op = operations[k];
-    
-    if (op.type !== 'equal') {
-      // Start a new hunk if needed
-      if (!currentHunk) {
-        const contextStart = Math.max(0, k - context);
-        const oldStart = operations[contextStart].oldIndex !== undefined ? operations[contextStart].oldIndex! + 1 : 1;
-        const newStart = operations[contextStart].newIndex !== undefined ? operations[contextStart].newIndex! + 1 : 1;
-        
-        currentHunk = {
-          oldStart,
-          oldCount: 0,
-          newStart,
-          newCount: 0,
-          operations: operations.slice(contextStart, k + 1)
-        };
-      } else {
-        // Extend current hunk
-        currentHunk.operations.push(op);
-      }
-    } else if (currentHunk) {
-      // Add context after changes
-      currentHunk.operations.push(op);
-      
-      // Check if we should close this hunk
-      let contextAfter = 0;
-      for (let l = k + 1; l < operations.length && l <= k + context; l++) {
-        if (operations[l].type === 'equal') {
-          contextAfter++;
-          currentHunk.operations.push(operations[l]);
-        } else {
-          break;
-        }
-      }
-      
-      // Close hunk if no more changes within context
-      let hasMoreChanges = false;
-      for (let l = k + contextAfter + 1; l < Math.min(operations.length, k + context * 2); l++) {
-        if (operations[l].type !== 'equal') {
-          hasMoreChanges = true;
-          break;
-        }
-      }
-      
-      if (!hasMoreChanges) {
-        // Calculate counts
-        currentHunk.oldCount = currentHunk.operations.filter(op => op.type === 'equal' || op.type === 'delete').length;
-        currentHunk.newCount = currentHunk.operations.filter(op => op.type === 'equal' || op.type === 'insert').length;
-        
-        hunks.push(currentHunk);
-        currentHunk = null;
-        k += contextAfter; // Skip the context we already processed
-      }
-    }
+
+  const out: string[] = [
+    `--- ${fromFile}`,
+    `+++ ${toFile}`,
+    `@@ -${ctxStart + 1},${subOrig.length} +${ctxStart + 1},${subNew.length} @@`,
+  ];
+
+  for (const op of ops) {
+    if (op.type === 'equal') out.push(` ${op.line}`);
+    else if (op.type === 'delete') out.push(`-${op.line}`);
+    else out.push(`+${op.line}`);
   }
-  
-  // Close any remaining hunk
-  if (currentHunk) {
-    currentHunk.oldCount = currentHunk.operations.filter(op => op.type === 'equal' || op.type === 'delete').length;
-    currentHunk.newCount = currentHunk.operations.filter(op => op.type === 'equal' || op.type === 'insert').length;
-    hunks.push(currentHunk);
-  }
-  
-  // Generate unified diff output
-  result.push(`--- ${fromFile}`);
-  result.push(`+++ ${toFile}`);
-  
-  for (const hunk of hunks) {
-    result.push(`@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`);
-    
-    for (const op of hunk.operations) {
-      if (op.type === 'equal') {
-        result.push(` ${op.oldLine}`);
-      } else if (op.type === 'delete') {
-        result.push(`-${op.oldLine}`);
-      } else if (op.type === 'insert') {
-        result.push(`+${op.newLine}`);
-      }
-    }
-  }
-  
-  return result;
+  return out;
 }
 
-/**
- * Parse diff lines into chunks
- */
 function parseDiffIntoChunks(diffLines: string[]): DiffChunk[] {
   const chunks: DiffChunk[] = [];
   let currentChunk: DiffChunk | null = null;
-  
+
   for (const line of diffLines) {
     if (line.startsWith('@@')) {
-      // New chunk marker
-      if (currentChunk) {
-        chunks.push(currentChunk);
-      }
+      if (currentChunk) chunks.push(currentChunk);
       currentChunk = { header: line, lines: [line] };
     } else if (currentChunk) {
       currentChunk.lines.push(line);
     }
   }
-  
-  if (currentChunk) {
-    chunks.push(currentChunk);
-  }
-  
+  if (currentChunk) chunks.push(currentChunk);
   return chunks;
 }

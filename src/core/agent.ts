@@ -5,6 +5,12 @@ import { validateReadBeforeEdit, getReadBeforeEditError } from '../tools/validat
 import { ALL_TOOL_SCHEMAS, DANGEROUS_TOOLS, APPROVAL_REQUIRED_TOOLS } from '../tools/tool-schemas.js';
 import { ConfigManager } from '../utils/local-settings.js';
 import { getProxyAgent, getProxyInfo } from '../utils/proxy-config.js';
+import { resolveSmartPath, canonicalizePath } from '../utils/file-ops.js';
+import {
+  FREE_TIER_MODEL_POOL,
+  supportsParallelToolCalls,
+  getOptimalReasoningEffort,
+} from '../utils/models.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -15,8 +21,91 @@ interface Message {
   tool_call_id?: string;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Free-Tier token budget constants (Groq: 8.000 TPM per model, per organization)
+// Request size = prompt tokens + reserved completion tokens → must stay ≤ 8.000!
+// ─────────────────────────────────────────────────────────────────────────────
+const TPM_LIMIT = 8000;
+const TPM_SAFETY_MARGIN = 350;
+const MAX_COMPLETION_TOKENS = 3072; // was 8000 — the original cause of instant HTTP 413!
+const MIN_COMPLETION_TOKENS = 1024;
+const CHARS_PER_TOKEN = 3.4; // conservative estimate for mixed code/JSON
+const TOOLS_SCHEMA_TOKENS = Math.ceil(JSON.stringify(ALL_TOOL_SCHEMAS).length / CHARS_PER_TOKEN);
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+type FailoverErrorKind =
+  | 'auth'
+  | 'payload'      // 413 TPM / oversized request
+  | 'rate'         // 429 RPM/TPM/TPD
+  | 'model'        // 404 / decommissioned
+  | 'tool_salvage' // 400 tool_use_failed / malformed JSON generation
+  | 'server'
+  | 'network'
+  | 'abort'
+  | 'unknown';
+
+interface ClassifiedGroqError {
+  kind: FailoverErrorKind;
+  summary: string;
+  code?: string;
+  bucket?: string;
+  isDaily?: boolean;
+  retryAfterSeconds?: number;
+  failedGeneration?: string;
+}
+
+function classifyGroqError(error: any): ClassifiedGroqError {
+  const status = typeof error?.status === 'number' ? error.status : 0;
+  const payload = error?.error?.error ?? error?.error ?? {};
+  const code = payload?.code ? String(payload.code) : '';
+  const message: string = payload?.message || error?.message || String(error ?? 'unknown error');
+  const failedGeneration: string | undefined = payload?.failed_generation || error?.failed_generation;
+
+  const summary = code ? `API ${status || ''} ${code}: ${message}`.trim() : `API ${status || ''}: ${message}`.trim();
+
+  if (error?.name === 'AbortError' || /request was aborted|operation was aborted/i.test(message)) {
+    return { kind: 'abort', summary };
+  }
+  if (status === 401 || status === 403) {
+    return { kind: 'auth', summary, code };
+  }
+  if (status === 413) {
+    const bucketMatch = message.match(/tokens per (minute|day)/i);
+    return { kind: 'payload', summary, code, bucket: bucketMatch ? bucketMatch[0] : 'TPM' };
+  }
+  if (status === 429) {
+    const isDaily = /per day|daily|TPD|RPD|requests per day/i.test(message);
+    let retryAfterSeconds: number | undefined;
+    try {
+      const headers: any = error?.headers;
+      const raw = typeof headers?.get === 'function' ? headers.get('retry-after') : headers?.['retry-after'];
+      const parsed = raw != null ? parseFloat(String(raw)) : NaN;
+      if (!isNaN(parsed) && parsed > 0) retryAfterSeconds = parsed;
+    } catch {
+      // headers not accessible
+    }
+    const bucketMatch = message.match(/(tokens per minute|tokens per day|requests per minute|requests per day)/i);
+    return { kind: 'rate', summary, code, isDaily, retryAfterSeconds, bucket: bucketMatch ? bucketMatch[0] : 'rate limit' };
+  }
+  if (status === 404 || code === 'model_not_found' || /model_decommissioned|decommissioned|model not found/i.test(message)) {
+    return { kind: 'model', summary, code };
+  }
+  if (status === 400 && (code === 'tool_use_failed' || code === 'json_validate_failed' || code === 'json_not_valid' || failedGeneration)) {
+    return { kind: 'tool_salvage', summary, code, failedGeneration };
+  }
+  if (status >= 500) {
+    return { kind: 'server', summary, code };
+  }
+  if (status === 0 && /fetch failed|network|ENOTFOUND|ECONN|EAI_AGAIN|socket|timeout|aborted/i.test(message)) {
+    return { kind: 'network', summary };
+  }
+  return { kind: 'unknown', summary, code };
+}
+
 export class Agent {
   private client: Groq | null = null;
+  private activeApiKey: string | null = null;
   private messages: Message[] = [];
   private apiKey: string | null = null;
   private model: string;
@@ -33,9 +122,16 @@ export class Agent {
   private onMaxIterations?: (maxIterations: number) => Promise<boolean>;
   private onApiUsage?: (usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number; total_time?: number }) => void;
   private onError?: (error: string) => Promise<boolean>;
+  private onStatus?: (message: string) => void;
   private requestCount: number = 0;
   private currentAbortController: AbortController | null = null;
   private isInterrupted: boolean = false;
+
+  // ── Session intelligence: active-file ledger, edit history and read cache ──
+  private sessionFileLedger = new Map<string, { lastAction: string; detail: string; lineCount?: number; ts: number }>();
+  private editLedger: string[] = [];
+  private readResultCache = new Map<string, { content: any; message: string }>();
+  private readCacheIndex = new Map<string, Set<string>>(); // canonical path -> cache keys
 
   private constructor(
     model: string,
@@ -48,7 +144,7 @@ export class Agent {
     this.temperature = temperature;
     this.configManager = new ConfigManager();
     this.proxyOverride = proxyOverride;
-    
+
     // Set debug mode
     debugEnabled = debug || false;
 
@@ -95,7 +191,7 @@ export class Agent {
     const configManager = new ConfigManager();
     const defaultModel = configManager.getDefaultModel();
     const selectedModel = defaultModel || model;
-    
+
     const agent = new Agent(
       selectedModel,
       temperature,
@@ -107,58 +203,38 @@ export class Agent {
   }
 
   private buildDefaultSystemMessage(): string {
-    return `You are a coding assistant powered by ${this.model} on Groq. Tools are available to you. Use tools to complete tasks.
+    return `You are a coding assistant powered by ${this.model} on Groq (Free Tier: only 8.000 tokens/min — BE TOKEN-EFFICIENT in every tool call).
 
-CRITICAL: For ANY implementation request (building apps, creating components, writing code), you MUST use tools to create actual files. NEVER provide text-only responses for coding tasks that require implementation.
+LANGUAGE: Always respond in the same language the user writes in (Portuguese/Brazilian Portuguese if they write in Portuguese). Keep final answers short: 1-3 sentences plus a brief summary of what changed.
 
-Use tools to:
-- Read and understand files (read_file, list_files, search_files)
-- Create, edit, and manage files (create_file, edit_file, list_files, read_file, delete_file)
-- Execute commands (execute_command)
-- Search for information (search_files)
-- Help you understand the codebase before answering the user's question
+TOOLS (all accept absolute Android paths like /storage/emulated/0/Download/file.html, ~/ paths, or relative paths — never waste turns listing directories to "find" a file whose path you already know):
+- read_file: without start_line/end_line, files >180 lines return a structural OUTLINE + first 90 lines instead of the full content. NEVER re-read the same file/region twice in a session.
+- grep_file: search inside ONE file for a pattern (returns exact line numbers) — the fastest way to locate colors, ids, functions or text in large files.
+- search_files: find text across many files at once.
+- list_files: only when you truly don't know the directory structure.
+- edit_file: exact old_text→new_text replacement; supports batch edits:[{old_text,new_text}] for multiple changes in one call.
+- replace_lines: rewrite an exact line range (start_line, end_line, new_content) — ideal for large files once grep/outline gave you the line numbers.
+- create_file: for new files only (or overwrite=true to fully replace an existing one).
+- execute_command: quick commands only (tests, builds, ls, git status) — never servers or long-running processes.
 
-IMPLEMENTATION TASK RULES:
-- When asked to "build", "create", "implement", or "make" anything: USE TOOLS TO CREATE FILES
-- Start immediately with create_file or list_files - NO text explanations first
-- Create actual working code, not example snippets
-- Build incrementally: create core files first, then add features
-- NEVER respond with "here's how you could do it" - DO IT with tools
+LARGE-FILE WORKFLOW (files >500 lines, e.g. single-file HTML apps):
+1. read_file without lines → outline + first 90 lines
+2. grep_file to find the exact lines you need
+3. read_file with start_line/end_line for a small window if context is missing
+4. edit_file (exact text) or replace_lines (exact line range)
+5. verify with grep_file
 
-FILE OPERATION DECISION TREE:
-- ALWAYS check if file exists FIRST using list_files or read_file
-- Need to modify existing content? → read_file first, then edit_file (never create_file)
-- Need to create something new? → list_files to check existence first, then create_file
-- File exists but want to replace completely? → create_file with overwrite=true
-- Unsure if file exists? → list_files or read_file to check first
-- MANDATORY: read_file before any edit_file operation
+STRICT RULES:
+- MANDATORY: read_file or grep_file the target file before any edit_file/replace_lines.
+- Text matching in edit_file must be EXACT (including whitespace/indentation).
+- Tool outputs are capped — work with windows, outlines and grep, never full-file dumps.
+- NEVER prefix tool names with "repo_browser.".
+- Check the [SESSION FILE CONTEXT] system note: reuse exact paths and line knowledge already collected this session.
+- Don't generate markdown tables.
 
-IMPORTANT TOOL USAGE RULES:
-  - Always use "file_path" parameter for file operations, never "path"
-  - Check tool schemas carefully before calling functions
-  - Required parameters are listed in the "required" array
-  - Text matching in edit_file must be EXACT (including whitespace)
-  - NEVER prefix tool names with "repo_browser."
-
-COMMAND EXECUTION SAFETY:
-  - Only use execute_command for commands that COMPLETE QUICKLY (tests, builds, short scripts)
-  - NEVER run commands that start long-running processes (servers, daemons, web apps)
-  - Examples of AVOIDED commands: "flask app.py", "npm start", "python -m http.server"
-  - Examples of SAFE commands: "python test_script.py", "npm test", "ls -la", "git status"
-  - If a long-running command is needed to complete the task, provide it to the user at the end of the response, not as a tool call, with a description of what it's for.
-
-IMPORTANT: When creating files, keep them focused and reasonably sized. For large applications:
-1. Start with a simple, minimal version first
-2. Create separate files for different components
-3. Build incrementally rather than generating massive files at once
-
-Be direct and efficient.
-
-Don't generate markdown tables.
-
-When asked about your identity, you should identify yourself as a coding assistant running on the ${this.model} model via Groq.`;
+IMPLEMENTATION TASKS: when asked to build/create/modify something, USE TOOLS on real files — never reply with text-only plans.
+When asked about your identity, identify yourself as a coding assistant running on the ${this.model} model via Groq.`;
   }
-
 
   public setToolCallbacks(callbacks: {
     onToolStart?: (name: string, args: Record<string, any>) => void;
@@ -169,6 +245,7 @@ When asked about your identity, you should identify yourself as a coding assista
     onMaxIterations?: (maxIterations: number) => Promise<boolean>;
     onApiUsage?: (usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number; total_time?: number }) => void;
     onError?: (error: string) => Promise<boolean>;
+    onStatus?: (message: string) => void;
   }) {
     this.onToolStart = callbacks.onToolStart;
     this.onToolEnd = callbacks.onToolEnd;
@@ -178,29 +255,48 @@ When asked about your identity, you should identify yourself as a coding assista
     this.onMaxIterations = callbacks.onMaxIterations;
     this.onApiUsage = callbacks.onApiUsage;
     this.onError = callbacks.onError;
+    this.onStatus = callbacks.onStatus;
+  }
+
+  private notifyStatus(message: string): void {
+    debugLog('Status:', message);
+    if (this.onStatus) {
+      try {
+        this.onStatus(message);
+      } catch {
+        // never let a UI callback break the agent loop
+      }
+    }
   }
 
   public setApiKey(apiKey: string): void {
     debugLog('Setting API key in agent...');
     debugLog('API key provided:', apiKey ? `${apiKey.substring(0, 8)}...` : 'empty');
     this.apiKey = apiKey;
-    
+    this.activeApiKey = apiKey;
+
     // Get proxy configuration (with override if provided)
     const proxyAgent = getProxyAgent(this.proxyOverride);
     const proxyInfo = getProxyInfo(this.proxyOverride);
-    
+
     if (proxyInfo.enabled) {
       debugLog(`Using ${proxyInfo.type} proxy: ${proxyInfo.url}`);
     }
-    
+
     // Initialize Groq client with proxy if available
     const clientOptions: ClientOptions = { apiKey };
     if (proxyAgent) {
       clientOptions.httpAgent = proxyAgent;
     }
-    
+
     this.client = new Groq(clientOptions);
     debugLog('Groq client initialized with provided API key' + (proxyInfo.enabled ? ' and proxy' : ''));
+  }
+
+  /** Re-init the Groq client only when the key actually changes (used for key rotation). */
+  private ensureClient(apiKey: string): void {
+    if (this.client && this.activeApiKey === apiKey) return;
+    this.setApiKey(apiKey);
   }
 
   public saveApiKey(apiKey: string): void {
@@ -211,6 +307,7 @@ When asked about your identity, you should identify yourself as a coding assista
   public clearApiKey(): void {
     this.configManager.clearApiKey();
     this.apiKey = null;
+    this.activeApiKey = null;
     this.client = null;
   }
 
@@ -219,10 +316,12 @@ When asked about your identity, you should identify yourself as a coding assista
     this.messages = this.messages.filter(msg => msg.role === 'system');
   }
 
-  public setModel(model: string): void {
+  public setModel(model: string, options: { persist?: boolean } = {}): void {
+    const persist = options.persist !== false;
     this.model = model;
-    // Save as default model
-    this.configManager.setDefaultModel(model);
+    if (persist) {
+      this.configManager.setDefaultModel(model);
+    }
     // Update system message to reflect new model
     const newSystemMessage = this.buildDefaultSystemMessage();
     this.systemMessage = newSystemMessage;
@@ -244,12 +343,12 @@ When asked about your identity, you should identify yourself as a coding assista
   public interrupt(): void {
     debugLog('Interrupting current request');
     this.isInterrupted = true;
-    
+
     if (this.currentAbortController) {
       debugLog('Aborting current API request');
       this.currentAbortController.abort();
     }
-    
+
     // Add interruption message to conversation
     this.messages.push({
       role: 'system',
@@ -257,10 +356,388 @@ When asked about your identity, you should identify yourself as a coding assista
     });
   }
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // Context compaction engine (sliding window over conversation blocks)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  private estimateTextTokens(text: string): number {
+    return Math.ceil((text?.length || 0) / CHARS_PER_TOKEN);
+  }
+
+  private estimateMessagesTokens(messages: Message[]): number {
+    let total = 0;
+    for (const m of messages) {
+      total += 4; // role/instruction overhead per message
+      total += this.estimateTextTokens(m.content);
+      if (m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          total += this.estimateTextTokens(tc?.function?.name || '');
+          total += this.estimateTextTokens(tc?.function?.arguments || '');
+        }
+      }
+    }
+    return total;
+  }
+
+  private messageBudgetTokens(emergency: boolean): number {
+    const usable = TPM_LIMIT - TPM_SAFETY_MARGIN - TOOLS_SCHEMA_TOKENS - 140;
+    const budget = emergency ? usable - MIN_COMPLETION_TOKENS : usable - MAX_COMPLETION_TOKENS;
+    return Math.floor(emergency ? budget * 0.75 : budget);
+  }
+
+  /** Group the conversation into atomic blocks: [assistant(+tool_calls) ... its tool results] or standalone messages. */
+  private buildBlocks(): Message[][] {
+    const blocks: Message[][] = [];
+    let current: Message[] = [];
+    for (const msg of this.messages) {
+      if (msg.role === 'tool') {
+        current.push(msg);
+        continue;
+      }
+      if (current.length) {
+        blocks.push(current);
+        current = [];
+      }
+      if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
+        current.push(msg); // block stays open so its tool results join it
+        continue;
+      }
+      blocks.push([msg]);
+    }
+    if (current.length) blocks.push(current);
+    return blocks;
+  }
+
+  private buildSessionContextMessage(): Message | null {
+    if (this.sessionFileLedger.size === 0 && this.editLedger.length === 0) return null;
+
+    const fileLines: string[] = [];
+    const entries = [...this.sessionFileLedger.entries()].slice(-6);
+    for (const [p, info] of entries) {
+      fileLines.push(
+        `- ${p}${info.lineCount ? ` (${info.lineCount} lines)` : ''} — last: ${info.lastAction}${info.detail ? ` (${info.detail})` : ''}`
+      );
+    }
+
+    const ledgerLines = this.editLedger.slice(-6).map((l, i) => `${i + 1}. ${l}`);
+
+    let content = [
+      '[SESSION FILE CONTEXT — automatically tracked, refreshes every turn]',
+      'Known file paths (reuse these EXACT paths; never list directories to find them again):',
+      ...fileLines,
+      this.editLedger.length > 0 ? 'Recent change ledger (most recent last):' : '',
+      ...ledgerLines,
+      'For large files never re-read everything: use grep_file, read_file with start_line/end_line, or replace_lines with exact line numbers.',
+    ].filter(Boolean).join('\n');
+
+    if (content.length > 2600) {
+      content = '[SESSION FILE CONTEXT — truncated]\n' + content.slice(content.length - 2600);
+    }
+
+    return { role: 'system', content };
+  }
+
+  private summarizeBlock(block: Message[]): string | null {
+    const first = block[0];
+    if (!first || first.role === 'system') return null;
+    const clip = (s: string, n = 90) => (s || '').replace(/\s+/g, ' ').slice(0, n);
+    if (first.role === 'user') {
+      return `user: "${clip(first.content)}"`;
+    }
+    if (first.role === 'assistant') {
+      if (first.tool_calls?.length) {
+        const names = first.tool_calls.map((tc: any) => {
+          let arg = '';
+          try {
+            const a = typeof tc.function?.arguments === 'string'
+              ? JSON.parse(tc.function.arguments)
+              : tc.function?.arguments || {};
+            arg = a.file_path || a.directory || a.pattern || '';
+          } catch {
+            arg = '';
+          }
+          return `${tc.function?.name}${arg ? `(${arg})` : '()'}`;
+        }).join(', ');
+        return `assistant → tools: ${clip(names, 120)}`;
+      }
+      return `assistant: "${clip(first.content)}"`;
+    }
+    return null;
+  }
+
+  private buildOptimizedMessages(emergency: boolean): Message[] {
+    const blocks = this.buildBlocks();
+
+    const firstNonSystem = blocks.findIndex(b => !(b.length === 1 && b[0].role === 'system'));
+    const leadingSystemCount = firstNonSystem === -1 ? blocks.length : firstNonSystem;
+
+    const sessionCtx = this.buildSessionContextMessage();
+    const sessionCtxTokens = sessionCtx ? this.estimateMessagesTokens([sessionCtx]) : 0;
+    const budget = Math.max(600, this.messageBudgetTokens(emergency) - sessionCtxTokens);
+
+    const toolCharLimit = emergency ? 350 : 1400;
+    const argCharLimit = emergency ? 160 : 240;
+    const recentFullBlocks = emergency ? 1 : 2;
+
+    // Walk from the newest block backwards deciding what still fits
+    const kept: Array<{ index: number; mode: 'full' | 'trimmed' }> = [];
+    const droppedIndexes: number[] = [];
+    let remaining = budget;
+
+    for (let i = blocks.length - 1; i >= leadingSystemCount; i--) {
+      const isRecent = kept.length < recentFullBlocks;
+      const fullTokens = this.estimateBlockTokens(blocks[i]);
+      const trimmedTokens = this.estimateBlockTokens(blocks[i], toolCharLimit, argCharLimit);
+
+      if (isRecent && fullTokens <= remaining) {
+        kept.unshift({ index: i, mode: 'full' });
+        remaining -= fullTokens;
+      } else if (trimmedTokens <= remaining) {
+        kept.unshift({ index: i, mode: 'trimmed' });
+        remaining -= trimmedTokens;
+      } else {
+        droppedIndexes.unshift(i);
+      }
+    }
+
+    // Leading system messages (main prompt + project context) always stay
+    const leading: Message[] = [];
+    for (let i = 0; i < leadingSystemCount; i++) {
+      for (const msg of blocks[i]) {
+        if (emergency && msg.content.length > 6000) {
+          leading.push({
+            role: msg.role,
+            content: msg.content.slice(0, 6000) + '\n…[project context truncated to fit token limits]',
+          });
+        } else {
+          leading.push(msg);
+        }
+      }
+    }
+
+    // Compact the dropped history into one small summary note
+    const summaryMessages: Message[] = [];
+    if (droppedIndexes.length > 0) {
+      const summaryLines: string[] = [];
+      for (const idx of droppedIndexes) {
+        const line = this.summarizeBlock(blocks[idx]);
+        if (line) summaryLines.push(line);
+      }
+      const keptSummaryLines = summaryLines.slice(-16);
+      let summaryBody = keptSummaryLines.map(l => (l.length > 130 ? l.slice(0, 127) + '…' : l)).join('\n');
+      while (summaryBody.length > 2200 && keptSummaryLines.length > 3) {
+        keptSummaryLines.shift();
+        summaryBody = keptSummaryLines.map(l => (l.length > 130 ? l.slice(0, 127) + '…' : l)).join('\n');
+      }
+      summaryMessages.push({
+        role: 'system',
+        content: `[COMPACTED CONTEXT] Earlier steps of this session (oldest first) were compacted to respect the 8K TPM limit:\n${summaryBody}`,
+      });
+    }
+
+    // Render kept blocks with the chosen compression level
+    const rendered: Message[] = [];
+    for (const k of kept) {
+      rendered.push(...this.renderBlock(blocks[k.index], k.mode, toolCharLimit, argCharLimit));
+    }
+
+    const finalMessages = [...leading, ...(sessionCtx ? [sessionCtx] : []), ...summaryMessages, ...rendered];
+    return finalMessages;
+  }
+
+  private estimateBlockTokens(block: Message[], toolCharLimit?: number, argCharLimit?: number): number {
+    let total = 4;
+    for (const m of block) {
+      let content = m.content || '';
+      if (toolCharLimit !== undefined && m.role === 'tool' && content.length > toolCharLimit) {
+        content = content.slice(0, toolCharLimit) + '…';
+      }
+      total += this.estimateTextTokens(content);
+      if (m.tool_calls) {
+        for (const tc of m.tool_calls) {
+          let args = tc?.function?.arguments || '';
+          if (argCharLimit !== undefined && args.length > argCharLimit) {
+            args = args.slice(0, argCharLimit) + '…';
+          }
+          total += this.estimateTextTokens(args) + 4;
+        }
+      }
+    }
+    return total;
+  }
+
+  private renderBlock(block: Message[], mode: 'full' | 'trimmed', toolCharLimit: number, argCharLimit: number): Message[] {
+    if (mode === 'full') return block;
+    return block.map(m => {
+      if (m.role === 'tool') {
+        const c = m.content || '';
+        if (c.length > toolCharLimit) {
+          const head = Math.ceil(toolCharLimit * 0.7);
+          const tail = Math.max(0, toolCharLimit - head);
+          return {
+            ...m,
+            content:
+              c.slice(0, head) +
+              `\n…[tool output truncated — ${c.length - toolCharLimit} chars omitted]…\n` +
+              (tail > 0 ? c.slice(-tail) : ''),
+          };
+        }
+        return m;
+      }
+      if (m.role === 'assistant' && m.tool_calls) {
+        return {
+          ...m,
+          tool_calls: m.tool_calls.map(tc => {
+            const a = typeof tc?.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc?.function?.arguments || {});
+            return a.length > argCharLimit
+              ? { ...tc, function: { ...tc.function, arguments: a.slice(0, argCharLimit) + '…[args truncated in history]' } }
+              : tc;
+          }),
+        };
+      }
+      if ((m.role === 'assistant' || m.role === 'user') && (m.content || '').length > 1500) {
+        const c = m.content;
+        return { ...m, content: c.slice(0, 1000) + `\n…[content truncated, ${c.length - 1000} chars omitted]…\n` + c.slice(-400) };
+      }
+      return m;
+    });
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Session intelligence: read cache + file ledger
+  // ───────────────────────────────────────────────────────────────────────────
+
+  private getCachedReadResult(toolName: string, toolArgs: Record<string, any>): { content: any; message: string } | null {
+    try {
+      const resolved = resolveSmartPath(toolArgs.file_path);
+      const stat = fs.statSync(resolved);
+      const key = this.buildReadCacheKey(toolName, resolved, stat.mtimeMs, toolArgs);
+      return this.readResultCache.get(key) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private buildReadCacheKey(toolName: string, resolvedPath: string, mtimeMs: number, toolArgs: Record<string, any>): string {
+    return [
+      toolName,
+      resolvedPath,
+      mtimeMs,
+      toolArgs.start_line ?? '',
+      toolArgs.end_line ?? '',
+      toolArgs.pattern ?? '',
+      toolArgs.is_regex ?? '',
+      toolArgs.context_lines ?? '',
+    ].join('|');
+  }
+
+  private cacheReadResult(toolName: string, toolArgs: Record<string, any>, result: any): void {
+    try {
+      const resolved = resolveSmartPath(toolArgs.file_path);
+      const stat = fs.statSync(resolved);
+      const key = this.buildReadCacheKey(toolName, resolved, stat.mtimeMs, toolArgs);
+      this.readResultCache.set(key, { content: result.content, message: result.message || '' });
+
+      let canon = '';
+      try {
+        canon = canonicalizePath(toolArgs.file_path);
+      } catch {
+        canon = resolved;
+      }
+      if (!this.readCacheIndex.has(canon)) this.readCacheIndex.set(canon, new Set());
+      this.readCacheIndex.get(canon)!.add(key);
+
+      // Keep the cache small
+      if (this.readResultCache.size > 12) {
+        const oldest = this.readResultCache.keys().next().value;
+        if (oldest !== undefined) {
+          this.readResultCache.delete(oldest);
+          for (const set of this.readCacheIndex.values()) set.delete(oldest);
+        }
+      }
+    } catch {
+      // cache is best-effort
+    }
+  }
+
+  private invalidateReadCache(filePath: string): void {
+    try {
+      let canon = '';
+      try {
+        canon = canonicalizePath(filePath);
+      } catch {
+        canon = resolveSmartPath(filePath);
+      }
+      const keys = this.readCacheIndex.get(canon);
+      if (keys) {
+        for (const k of keys) this.readResultCache.delete(k);
+        this.readCacheIndex.delete(canon);
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  private trackFileAccess(toolName: string, toolArgs: Record<string, any>, result: any): void {
+    if (!result?.success) return;
+    const target = toolArgs?.file_path || toolArgs?.path || (toolName === 'list_files' ? toolArgs?.directory : undefined);
+    if (!target || typeof target !== 'string') return;
+
+    try {
+      let canon: string;
+      try {
+        canon = canonicalizePath(target);
+      } catch {
+        canon = resolveSmartPath(target);
+      }
+
+      const isMutating = ['edit_file', 'replace_lines', 'create_file', 'delete_file'].includes(toolName);
+      if (isMutating) {
+        this.invalidateReadCache(target);
+      }
+
+      let detail = '';
+      if (toolName === 'edit_file') {
+        const n = Array.isArray(toolArgs.edits) && toolArgs.edits.length > 0 ? toolArgs.edits.length : 1;
+        detail = `${n} text replacement${n > 1 ? 's' : ''}`;
+      } else if (toolName === 'replace_lines') {
+        detail = `L${toolArgs.start_line}-${toolArgs.end_line} rewritten`;
+      } else if (toolName === 'create_file') {
+        detail = `created (${String(toolArgs.content || '').split('\n').length} lines)`;
+      } else if (toolName === 'delete_file') {
+        detail = 'deleted';
+      }
+
+      const info = this.sessionFileLedger.get(canon) || { lastAction: '', detail: '', ts: 0 };
+      info.lastAction = toolName;
+      info.detail = detail;
+      info.ts = Date.now();
+
+      if (toolName === 'read_file' || toolName === 'grep_file') {
+        const msg = result?.message || '';
+        const m = msg.match(/\(of (\d+)\)/) || msg.match(/of (\d+) lines?/i);
+        if (m) info.lineCount = parseInt(m[1], 10);
+      }
+
+      this.sessionFileLedger.set(canon, info);
+
+      if (isMutating) {
+        this.editLedger.push(`${toolName} → ${target}${detail ? ` (${detail})` : ''}`);
+        if (this.editLedger.length > 10) this.editLedger.shift();
+      }
+    } catch {
+      // ledger is best-effort
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Main chat loop
+  // ───────────────────────────────────────────────────────────────────────────
+
   async chat(userInput: string): Promise<void> {
     // Reset interrupt flag at the start of a new chat
     this.isInterrupted = false;
-    
+
     // Check API key on first message send
     if (!this.client) {
       debugLog('Initializing Groq client...');
@@ -270,9 +747,10 @@ When asked about your identity, you should identify yourself as a coding assista
         debugLog('Using API key from environment variable');
         this.setApiKey(envApiKey);
       } else {
-        // Try config file
+        // Try config file (supports multi-key pools for rotation)
         debugLog('Environment variable GROQ_API_KEY not found, checking config file');
-        const configApiKey = this.configManager.getApiKey();
+        const keys = this.configManager.getApiKeys();
+        const configApiKey = keys.length > 0 ? keys[0] : null;
         if (configApiKey) {
           debugLog('Using API key from config file');
           this.setApiKey(configApiKey);
@@ -298,7 +776,7 @@ When asked about your identity, you should identify yourself as a coding assista
           this.currentAbortController = null;
           return;
         }
-        
+
         try {
           // Check client exists
           if (!this.client) {
@@ -308,50 +786,20 @@ When asked about your identity, you should identify yourself as a coding assista
           debugLog('Making API call to Groq with model:', this.model);
           debugLog('Messages count:', this.messages.length);
           debugLog('Last few messages:', this.messages.slice(-3));
-          
-          // Prepare request body for curl logging
-          const requestBody = {
-            model: this.model,
-            messages: this.messages,
-            tools: ALL_TOOL_SCHEMAS,
-            tool_choice: 'auto' as const,
-            temperature: this.temperature,
-            max_tokens: 8000,
-            stream: false as const
-          };
-          
-          // Log equivalent curl command
-          this.requestCount++;
-          const curlCommand = generateCurlCommand(this.apiKey!, requestBody, this.requestCount);
-          if (curlCommand) {
-            debugLog('Equivalent curl command:', curlCommand);
-          }
-          
-          // Create AbortController for this request
-          this.currentAbortController = new AbortController();
-          
-          const response = await this.client.chat.completions.create({
-            model: this.model,
-            messages: this.messages as any,
-            tools: ALL_TOOL_SCHEMAS,
-            tool_choice: 'auto',
-            temperature: this.temperature,
-            max_tokens: 8000,
-            stream: false
-          }, {
-            signal: this.currentAbortController.signal
-          });
+
+          // The whole request (compaction + model/key failover) happens inside
+          const response = await this.callWithFailover();
 
           debugLog('Full API response received:', response);
           debugLog('Response usage:', response.usage);
           debugLog('Response finish_reason:', response.choices[0].finish_reason);
           debugLog('Response choices length:', response.choices.length);
-          
+
           const message = response.choices[0].message;
-          
+
           // Extract reasoning if present
           const reasoning = (message as any).reasoning;
-          
+
           // Pass usage data to callback if available
           if (response.usage && this.onApiUsage) {
             this.onApiUsage({
@@ -364,7 +812,7 @@ When asked about your identity, you should identify yourself as a coding assista
           debugLog('Message content length:', message.content?.length || 0);
           debugLog('Message has tool_calls:', !!message.tool_calls);
           debugLog('Message tool_calls count:', message.tool_calls?.length || 0);
-          
+
           if (response.choices[0].finish_reason !== 'stop' && response.choices[0].finish_reason !== 'tool_calls') {
             debugLog('WARNING - Unexpected finish_reason:', response.choices[0].finish_reason);
           }
@@ -394,7 +842,7 @@ When asked about your identity, you should identify yourself as a coding assista
                 this.currentAbortController = null;
                 return;
               }
-              
+
               const result = await this.executeToolCall(toolCall);
 
               // Add tool result to conversation (including rejected ones)
@@ -425,7 +873,7 @@ When asked about your identity, you should identify yourself as a coding assista
           debugLog('Final response - no tool calls detected');
           debugLog('Final content length:', content.length);
           debugLog('Final content preview:', content.substring(0, 200));
-          
+
           if (this.onFinalMessage) {
             debugLog('Calling onFinalMessage callback');
             this.onFinalMessage(content, reasoning);
@@ -445,7 +893,7 @@ When asked about your identity, you should identify yourself as a coding assista
 
         } catch (error) {
           this.currentAbortController = null; // Clear abort controller
-          
+
           // Check if this is an abort error due to user interruption
           if (error instanceof Error && (
             error.message.includes('Request was aborted') ||
@@ -456,17 +904,17 @@ When asked about your identity, you should identify yourself as a coding assista
             // Don't add error message if it's an interruption - the interrupt message was already added
             return;
           }
-          
+
           debugLog('Error occurred during API call:', error);
           debugLog('Error details:', {
             message: error instanceof Error ? error.message : String(error),
             stack: error instanceof Error ? error.stack : 'No stack available'
           });
-          
+
           // Add API error as context message instead of terminating chat
           let errorMessage = 'Unknown error occurred';
           let is401Error = false;
-          
+
           if (error instanceof Error) {
             // Check if it's an API error with more details
             if ('status' in error && 'error' in error) {
@@ -486,12 +934,12 @@ When asked about your identity, you should identify yourself as a coding assista
           } else {
             errorMessage = `Error: ${String(error)}`;
           }
-          
+
           // For 401 errors (invalid API key), don't retry - terminate immediately
           if (is401Error) {
             throw new Error(`${errorMessage}. Please check your API key and use /login to set a valid key.`);
           }
-          
+
           // Ask user if they want to retry via callback
           if (this.onError) {
             const shouldRetry = await this.onError(errorMessage);
@@ -514,7 +962,7 @@ When asked about your identity, you should identify yourself as a coding assista
               role: 'system',
               content: `Previous API request failed with error: ${errorMessage}. Please try a different approach or ask the user for clarification.`
             });
-            
+
             // Continue conversation loop to let model attempt recovery
             iteration++;
             continue;
@@ -538,6 +986,238 @@ When asked about your identity, you should identify yourself as a coding assista
     }
   }
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // Automatic model + API-key failover across the Groq Free-Tier pool
+  // ───────────────────────────────────────────────────────────────────────────
+
+  private buildRequestBody(model: string, messages: Message[], promptTokensEstimate: number): any {
+    const maxTokens = Math.max(
+      MIN_COMPLETION_TOKENS,
+      Math.min(MAX_COMPLETION_TOKENS, TPM_LIMIT - TPM_SAFETY_MARGIN - promptTokensEstimate)
+    );
+
+    const request: any = {
+      model,
+      messages,
+      tools: ALL_TOOL_SCHEMAS,
+      tool_choice: 'auto',
+      temperature: this.temperature,
+      max_tokens: maxTokens,
+      stream: false,
+    };
+
+    // Only request parallel tool calls on models that actually support it
+    // (openai/gpt-oss-* do NOT support parallel tool use on Groq!)
+    if (supportsParallelToolCalls(model)) {
+      request.parallel_tool_calls = true;
+    }
+
+    const effort = getOptimalReasoningEffort(model);
+    if (effort) {
+      request.reasoning_effort = effort;
+    }
+
+    return request;
+  }
+
+  private async callWithFailover(): Promise<any> {
+    // Build the model rotation order: current model first, then the rest of the Free-Tier pool
+    const primaryIdx = Math.max(0, FREE_TIER_MODEL_POOL.indexOf(this.model));
+    const pool = [
+      ...new Set([
+        this.model,
+        ...FREE_TIER_MODEL_POOL.slice(primaryIdx + 1),
+        ...FREE_TIER_MODEL_POOL.slice(0, primaryIdx),
+      ]),
+    ];
+
+    const keyList = this.configManager.getApiKeys();
+    const keys = keyList.length > 0 ? keyList : this.apiKey ? [this.apiKey] : [];
+
+    if (keys.length === 0) {
+      throw new Error('No API key available. Please use /login to set your Groq API key.');
+    }
+
+    let emergencyUsed = 0;   // how many times we rebuilt the context with emergency compaction
+    let waitUsed = 0;        // short retry-after waits already consumed
+    let sameComboRetries = 0;
+    let lastErrorSummary = 'unknown error';
+
+    let modelIdx = 0;
+    let keyIdx = 0;
+    let guard = 0;
+
+    while (modelIdx < pool.length && guard++ < 60) {
+      const model = pool[modelIdx];
+
+      if (keyIdx >= keys.length) {
+        modelIdx++;
+        keyIdx = 0;
+        sameComboRetries = 0;
+        continue;
+      }
+
+      const apiKey = keys[keyIdx];
+
+      try {
+        this.ensureClient(apiKey);
+
+        const messages = this.buildOptimizedMessages(emergencyUsed > 0);
+        const promptEstimate = TOOLS_SCHEMA_TOKENS + 140 + this.estimateMessagesTokens(messages);
+        const request = this.buildRequestBody(model, messages, promptEstimate);
+
+        debugLog(`Attempt → model=${model} keyIndex=${keyIdx} emergency=${emergencyUsed > 0} estPromptTokens≈${promptEstimate} maxTokens=${request.max_tokens}`);
+        this.requestCount++;
+        const curlCommand = generateCurlCommand(this.apiKey!, request, this.requestCount);
+        if (curlCommand) {
+          debugLog('Equivalent curl command:', curlCommand);
+        }
+
+        this.currentAbortController = new AbortController();
+        const response = await this.client!.chat.completions.create(request, {
+          signal: this.currentAbortController.signal,
+        });
+
+        // Success — adopt the model that answered
+        if (model !== this.model) {
+          this.notifyStatus(`🔄 Continuando automaticamente com o modelo ${model} — histórico da conversa preservado.`);
+        }
+        this.model = model;
+        this.currentAbortController = null;
+        return response;
+
+      } catch (error) {
+        this.currentAbortController = null;
+        const cls = classifyGroqError(error);
+        lastErrorSummary = cls.summary;
+
+        if (cls.kind === 'abort') {
+          throw error;
+        }
+
+        debugLog('API attempt failed', { model, keyIndex: keyIdx, kind: cls.kind, code: cls.code, summary: cls.summary });
+
+        switch (cls.kind) {
+          case 'auth': {
+            this.notifyStatus(
+              `🔑 Chave API #${keyIdx + 1} rejeitada (401). ${
+                keyIdx + 1 < keys.length ? `Tentando automaticamente a chave #${keyIdx + 2}...` : 'Nenhuma chave válida restante.'
+              }`
+            );
+            sameComboRetries = 0;
+            keyIdx++;
+            break;
+          }
+
+          case 'payload': {
+            // 413: request (prompt + completion) exceeded the model TPM bucket
+            if (sameComboRetries < 1 && emergencyUsed < 2) {
+              emergencyUsed++;
+              sameComboRetries++;
+              this.notifyStatus(`🧹 Contexto excedeu o limite de tokens do ${model}. Comprimindo o histórico da conversa e tentando de novo...`);
+              break; // retry same model + same key
+            }
+            sameComboRetries = 0;
+            const nextIsKey = keyIdx + 1 < keys.length;
+            this.notifyStatus(
+              `📦 ${model} não comporta mais o contexto (${cls.bucket || 'TPM'}). ${
+                nextIsKey ? 'Testando a próxima chave API...' : 'Alternando para o próximo modelo...'
+              }`
+            );
+            keyIdx++;
+            break;
+          }
+
+          case 'rate': {
+            const canWait =
+              !cls.isDaily &&
+              cls.retryAfterSeconds !== undefined &&
+              cls.retryAfterSeconds <= 20 &&
+              waitUsed < 1 &&
+              modelIdx === 0 &&
+              keyIdx === 0;
+
+            if (canWait) {
+              waitUsed++;
+              this.notifyStatus(`⏳ Limite de velocidade no ${model} (${cls.bucket}). Aguardando ${cls.retryAfterSeconds}s antes de tentar de novo...`);
+              await sleep(cls.retryAfterSeconds! * 1000 + 400);
+              break; // retry same combo
+            }
+
+            sameComboRetries = 0;
+            const nextIsKey = keyIdx + 1 < keys.length;
+            this.notifyStatus(
+              cls.isDaily
+                ? `🚫 Cota DIÁRIA esgotada para ${model} (chave #${keyIdx + 1}). ${
+                    nextIsKey ? 'Trocando para a próxima chave...' : 'Alternando para o próximo modelo...'
+                  }`
+                : `⚠️ ${model} atingiu o limite de ${cls.bucket || 'velocidade'} (chave #${keyIdx + 1}). ${
+                    nextIsKey ? 'Trocando para a próxima chave...' : 'Alternando para o próximo modelo...'
+                  }`
+            );
+            keyIdx++;
+            break;
+          }
+
+          case 'model': {
+            sameComboRetries = 0;
+            this.notifyStatus(`🗑️ Modelo ${model} indisponível (${cls.code || '404'}). Alternando para o próximo modelo...`);
+            keyIdx = keys.length; // skip remaining keys for a dead model
+            break;
+          }
+
+          case 'tool_salvage': {
+            const salvaged = this.salvageToolUseFailure(cls.failedGeneration, cls.summary);
+            if (salvaged && sameComboRetries < 1) {
+              sameComboRetries++;
+              break; // retry same combo after repair
+            }
+            this.notifyStatus(`🛠️ O ${model} gerou uma chamada de ferramenta malformada. Tentando o próximo modelo...`);
+            sameComboRetries = 0;
+            keyIdx++;
+            break;
+          }
+
+          default: {
+            // server / network / unknown → one quick same-combo retry, then move on
+            if (sameComboRetries < 1) {
+              sameComboRetries++;
+              await sleep(700);
+              break;
+            }
+            sameComboRetries = 0;
+            keyIdx++;
+            break;
+          }
+        }
+      }
+    }
+
+    throw new Error(
+      `Todos os modelos do Free Tier (${pool.join(', ')}) e ${keys.length} chave(s) API foram tentados sem sucesso. Último erro: ${lastErrorSummary}. Dicas: aguarde ~1 minuto (limite TPM), cadastre uma chave extra com /login (rotação automática) ou troque de modelo com /model.`
+    );
+  }
+
+  /**
+   * Recover from HTTP 400 `tool_use_failed`: keep the raw generation as an
+   * assistant turn and ask the model to re-issue ONE clean tool call.
+   */
+  private salvageToolUseFailure(failedGeneration: string | undefined, reason: string): boolean {
+    try {
+      this.messages.push({
+        role: 'assistant',
+        content: (failedGeneration || '').slice(0, 1200) || '(previous response lost)',
+      });
+      this.messages.push({
+        role: 'user',
+        content: `SYSTEM REPAIR NOTE: your previous response failed with "${reason}" because the tool call was malformed or truncated. Re-issue the SAME intent now as ONE clean tool call with valid JSON arguments matching the tool schema exactly (no extra text, no markdown fences).`,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async executeToolCall(toolCall: any): Promise<Record<string, any>> {
     try {
       // Strip 'repo_browser.' prefix if present (some models hallucinate this)
@@ -546,13 +1226,22 @@ When asked about your identity, you should identify yourself as a coding assista
         toolName = toolName.substring('repo_browser.'.length);
       }
 
-      // Handle truncated tool calls
+      // Handle truncated/malformed tool call arguments
       let toolArgs: any;
       try {
-        toolArgs = JSON.parse(toolCall.function.arguments);
+        const rawArgs =
+          typeof toolCall.function.arguments === 'string'
+            ? toolCall.function.arguments
+            : JSON.stringify(toolCall.function.arguments || {});
+        toolArgs = JSON.parse(rawArgs);
+        if (toolArgs === null || typeof toolArgs !== 'object') toolArgs = {};
+        // Common model slip-up: "path" instead of "file_path"
+        if (!toolArgs.file_path && toolArgs.path && typeof toolArgs.path === 'string') {
+          toolArgs.file_path = toolArgs.path;
+        }
       } catch (error) {
         return {
-          error: `Tool arguments truncated: ${error}. Please break this into smaller pieces or use shorter content.`,
+          error: `Tool arguments truncated or invalid JSON: ${error}. Please re-issue this tool call with valid JSON arguments (or break it into smaller pieces).`,
           success: false
         };
       }
@@ -562,8 +1251,26 @@ When asked about your identity, you should identify yourself as a coding assista
         this.onToolStart(toolName, toolArgs);
       }
 
+      // Redundant-read guard: identical read on an unchanged file → cached answer
+      if ((toolName === 'read_file' || toolName === 'grep_file') && toolArgs.file_path) {
+        const cached = this.getCachedReadResult(toolName, toolArgs);
+        if (cached) {
+          const result = {
+            success: true,
+            content: cached.content,
+            message:
+              (cached.message || 'identical read') +
+              ' [CACHED: this exact file region is unchanged since your previous read — do NOT read it again; proceed directly with edit_file / replace_lines using the information you already have.]',
+          };
+          if (this.onToolEnd) {
+            this.onToolEnd(toolName, result);
+          }
+          return result;
+        }
+      }
+
       // Check read-before-edit for edit tools
-      if (toolName === 'edit_file' && toolArgs.file_path) {
+      if ((toolName === 'edit_file' || toolName === 'replace_lines') && toolArgs.file_path) {
         if (!validateReadBeforeEdit(toolArgs.file_path)) {
           const errorMessage = getReadBeforeEditError(toolArgs.file_path);
           const result = { error: errorMessage, success: false };
@@ -578,13 +1285,13 @@ When asked about your identity, you should identify yourself as a coding assista
       const isDangerous = DANGEROUS_TOOLS.includes(toolName);
       const requiresApproval = APPROVAL_REQUIRED_TOOLS.includes(toolName);
       const needsApproval = isDangerous || requiresApproval;
-      
+
       // For APPROVAL_REQUIRED_TOOLS, check if session auto-approval is enabled
       const canAutoApprove = requiresApproval && !isDangerous && this.sessionAutoApprove;
-            
+
       if (needsApproval && !canAutoApprove) {
         let approvalResult: { approved: boolean; autoApproveSession?: boolean };
-        
+
         if (this.onToolApproval) {
           // Check for interruption before waiting for approval
           if (this.isInterrupted) {
@@ -594,9 +1301,9 @@ When asked about your identity, you should identify yourself as a coding assista
             }
             return result;
           }
-          
+
           approvalResult = await this.onToolApproval(toolName, toolArgs);
-          
+
           // Check for interruption after approval process
           if (this.isInterrupted) {
             const result = { error: 'Tool execution interrupted by user', success: false, userRejected: true };
@@ -609,12 +1316,12 @@ When asked about your identity, you should identify yourself as a coding assista
           // No approval callback available, reject by default
           approvalResult = { approved: false };
         }
-        
+
         // Enable session auto-approval if requested (only for APPROVAL_REQUIRED_TOOLS)
         if (approvalResult.autoApproveSession && requiresApproval && !isDangerous) {
           this.sessionAutoApprove = true;
         }
-        
+
         if (!approvalResult.approved) {
           const result = { error: 'Tool execution canceled by user', success: false, userRejected: true };
           if (this.onToolEnd) {
@@ -623,9 +1330,15 @@ When asked about your identity, you should identify yourself as a coding assista
           return result;
         }
       }
-    
+
       // Execute tool
       const result = await executeTool(toolName, toolArgs);
+
+      // Session intelligence: cache reads + track the file ledger
+      if ((toolName === 'read_file' || toolName === 'grep_file') && result?.success && toolArgs.file_path) {
+        this.cacheReadResult(toolName, toolArgs, result);
+      }
+      this.trackFileAccess(toolName, toolArgs, result);
 
       // Notify UI about tool completion
       if (this.onToolEnd) {
@@ -641,7 +1354,6 @@ When asked about your identity, you should identify yourself as a coding assista
   }
 }
 
-
 // Debug logging to file
 const DEBUG_LOG_FILE = path.join(process.cwd(), 'debug-agent.log');
 let debugLogCleared = false;
@@ -649,13 +1361,13 @@ let debugEnabled = false;
 
 function debugLog(message: string, data?: any) {
   if (!debugEnabled) return;
-  
+
   // Clear log file on first debug log of each session
   if (!debugLogCleared) {
     fs.writeFileSync(DEBUG_LOG_FILE, '');
     debugLogCleared = true;
   }
-  
+
   const timestamp = new Date().toISOString();
   const logEntry = `[${timestamp}] ${message}${data ? '\n' + JSON.stringify(data, null, 2) : ''}\n`;
   fs.appendFileSync(DEBUG_LOG_FILE, logEntry);
@@ -663,18 +1375,18 @@ function debugLog(message: string, data?: any) {
 
 function generateCurlCommand(apiKey: string, requestBody: any, requestCount: number): string {
   if (!debugEnabled) return '';
-  
+
   const maskedApiKey = `${apiKey.substring(0, 8)}...${apiKey.substring(apiKey.length - 8)}`;
-  
+
   // Write request body to JSON file
   const jsonFileName = `debug-request-${requestCount}.json`;
   const jsonFilePath = path.join(process.cwd(), jsonFileName);
   fs.writeFileSync(jsonFilePath, JSON.stringify(requestBody, null, 2));
-  
+
   const curlCmd = `curl -X POST "https://api.groq.com/openai/v1/chat/completions" \\
   -H "Authorization: Bearer ${maskedApiKey}" \\
   -H "Content-Type: application/json" \\
   -d @${jsonFileName}`;
-  
+
   return curlCmd;
 }
