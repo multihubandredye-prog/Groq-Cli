@@ -3,11 +3,16 @@ import { listSessions } from '../../utils/session-store.js';
 
 export const resumeCommand: CommandDefinition = {
   command: 'resume',
-  description: 'Resume a saved conversation (/resume <nº> or title)',
-  handler: ({ addMessage, agent, resetMessages, args }: CommandContext) => {
+  description: 'Resume a saved conversation (arrow keys to pick)',
+  handler: ({ addMessage, resumeConversation, setShowSessionSelector, args }: CommandContext) => {
     const query = (args || '').trim();
 
+    // Sem argumentos → abre o SELETOR interativo (setas ↑/↓ + Enter)
     if (!query) {
+      if (setShowSessionSelector) {
+        setShowSessionSelector(true);
+        return;
+      }
       const all = listSessions();
       if (all.length === 0) {
         addMessage({
@@ -24,8 +29,8 @@ export const resumeCommand: CommandDefinition = {
       return;
     }
 
-    if (!agent || typeof agent.resumeSession !== 'function') {
-      addMessage({ role: 'system', content: '🔴 Agente não disponível para retomar sessão.' });
+    if (!resumeConversation) {
+      addMessage({ role: 'system', content: '🔴 Retomada de sessão não disponível nesta tela.' });
       return;
     }
 
@@ -41,18 +46,10 @@ export const resumeCommand: CommandDefinition = {
       target = all[idx].id;
     }
 
-    const result = agent.resumeSession(target);
+    const result = resumeConversation(target);
     if (!result) {
-      addMessage({ role: 'system', content: `🔴 Conversa não encontrada para "${query}". Use /sessions para listar as salvos.` });
+      addMessage({ role: 'system', content: `🔴 Conversa não encontrada para "${query}". Use /sessions para listar as salvas.` });
       return;
     }
-
-    // Limpa a UI; a memória restaurada fica no agente
-    if (resetMessages) resetMessages();
-
-    addMessage({
-      role: 'system',
-      content: `💾 Sessão "${result.title}" retomada! ${result.messageCount} mensagens restauradas (modelo: ${result.model}).\nA memória da conversa foi recarregada — pode continuar de onde parou.`,
-    });
   },
 };

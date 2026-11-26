@@ -10,6 +10,7 @@ import TokenMetrics from '../display/TokenMetrics.js';
 import PendingToolApproval from '../input-overlays/PendingToolApproval.js';
 import Login from '../input-overlays/Login.js';
 import ModelSelector from '../input-overlays/ModelSelector.js';
+import SessionSelector from '../input-overlays/SessionSelector.js';
 import MaxIterationsContinue from '../input-overlays/MaxIterationsContinue.js';
 import ErrorRetry from '../input-overlays/ErrorRetry.js';
 import { handleSlashCommand } from '../../../commands/index.js';
@@ -72,7 +73,7 @@ export default function Chat({ agent }: ChatProps) {
     addMessage,
     setApiKey,
     clearHistory,
-    resetMessages,
+    resumeConversation,
     toggleAutoApprove,
     toggleReasoning,
     interruptRequest,
@@ -83,6 +84,7 @@ export default function Chat({ agent }: ChatProps) {
   const [showInput, setShowInput] = useState(true);
   const [showLogin, setShowLogin] = useState(false);
   const [showModelSelector, setShowModelSelector] = useState(false);
+  const [showSessionSelector, setShowSessionSelector] = useState(false);
 
   // Handle global keyboard shortcuts
   useInput((input, key) => {
@@ -121,10 +123,10 @@ export default function Chat({ agent }: ChatProps) {
     }
   });
 
-  // Hide input when processing, waiting for approval, error retry, or showing login/model selector
+  // Hide input when processing, waiting for approval, error retry, or showing login/model/session selector
   useEffect(() => {
-    setShowInput(!isProcessing && !pendingApproval && !pendingError && !showLogin && !showModelSelector);
-  }, [isProcessing, pendingApproval, pendingError, showLogin, showModelSelector]);
+    setShowInput(!isProcessing && !pendingApproval && !pendingError && !showLogin && !showModelSelector && !showSessionSelector);
+  }, [isProcessing, pendingApproval, pendingError, showLogin, showModelSelector, showSessionSelector]);
 
 
   const handleSendMessage = async (message: string) => {
@@ -141,11 +143,12 @@ export default function Chat({ agent }: ChatProps) {
           },
           setShowLogin,
           setShowModelSelector,
+          setShowSessionSelector,
+          resumeConversation,
           toggleReasoning,
           showReasoning,
           sessionStats,
           agent,
-          resetMessages,
         });
         return;
       }
@@ -201,6 +204,21 @@ export default function Chat({ agent }: ChatProps) {
       role: 'system',
       content: 'Seleção de modelo cancelada.',
     });
+  };
+
+  const handleSessionPick = (sessionId: string) => {
+    setShowSessionSelector(false);
+    const result = resumeConversation(sessionId);
+    if (!result) {
+      addMessage({
+        role: 'system',
+        content: '🔴 Não foi possível retomar a conversa selecionada.',
+      });
+    }
+  };
+
+  const handleSessionCancel = () => {
+    setShowSessionSelector(false);
   };
 
   return (
@@ -265,6 +283,11 @@ export default function Chat({ agent }: ChatProps) {
             onSubmit={handleModelSelect}
             onCancel={handleModelCancel}
             currentModel={agent.getCurrentModel?.() || undefined}
+          />
+        ) : showSessionSelector ? (
+          <SessionSelector
+            onSubmit={handleSessionPick}
+            onCancel={handleSessionCancel}
           />
         ) : showInput ? (
           <MessageInput

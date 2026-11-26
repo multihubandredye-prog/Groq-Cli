@@ -3,11 +3,12 @@ export interface CommandContext {
   clearHistory: () => void;
   setShowLogin: (show: boolean) => void;
   setShowModelSelector?: (show: boolean) => void;
+  setShowSessionSelector?: (show: boolean) => void;
+  resumeConversation?: (sessionId: string) => { title: string; messageCount: number; model: string } | null;
   toggleReasoning?: () => void;
   showReasoning?: boolean;
   args?: string;
   agent?: any;
-  resetMessages?: () => void;
   sessionStats?: {
     promptTokens: number;
     completionTokens: number;

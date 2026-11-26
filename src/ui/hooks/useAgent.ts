@@ -389,13 +389,73 @@ export function useAgent(
     agent.clearHistory();
   }, [agent]);
 
-  // Limpa apenas a UI (usado ao retomar uma sessão salva — as mensagens restauradas
-  // ficam no agente e reaparecem conforme a conversa continua)
-  const resetMessages = useCallback(() => {
+  /**
+   * Retoma uma sessão salva: restaura na memória da IA E reexibe toda a
+   * conversa na tela (usuário, respostas e chamadas de ferramenta), para que
+   * o raciocínio continue visível e o agente siga de onde parou.
+   */
+  const resumeConversation = useCallback((sessionId: string): { title: string; messageCount: number; model: string } | null => {
+    const result = typeof agent.resumeSession === 'function' ? agent.resumeSession(sessionId) : null;
+    if (!result) return null;
+
     streamingIdRef.current = null;
-    setMessages([]);
-    setUserMessageHistory([]);
-  }, []);
+    pendingDeltaRef.current = null;
+
+    const rawMessages: any[] = (agent as any).messages || [];
+    const restored: ChatMessage[] = [];
+
+    for (const m of rawMessages) {
+      const ts = new Date();
+      const newId = () => Math.random().toString(36).slice(2, 11);
+
+      if (m.role === 'user') {
+        // Notas internas de reparo não são fala do usuário
+        if (/SYSTEM REPAIR NOTE/.test(m.content || '')) continue;
+        restored.push({ id: newId(), role: 'user', content: m.content || '', timestamp: ts });
+      } else if (m.role === 'assistant') {
+        if ((m.content || '').trim()) {
+          restored.push({ id: newId(), role: 'assistant', content: m.content, timestamp: ts });
+        }
+        // Chamadas de ferramenta viram caixas compactas no histórico
+        if (Array.isArray(m.tool_calls)) {
+          for (const tc of m.tool_calls) {
+            let args: any = {};
+            try {
+              args = typeof tc?.function?.arguments === 'string'
+                ? JSON.parse(tc.function.arguments)
+                : tc?.function?.arguments || {};
+            } catch {
+              args = {};
+            }
+            restored.push({
+              id: newId(),
+              role: 'tool_execution',
+              content: `${tc?.function?.name} (restaurado da sessão)`,
+              toolExecution: {
+                id: newId(),
+                name: String(tc?.function?.name || 'tool'),
+                args,
+                status: 'completed',
+                result: { success: true, message: 'Chamada restaurada do histórico da sessão' },
+              },
+              timestamp: ts,
+            });
+          }
+        }
+      }
+      // role 'tool' e 'system' permanecem apenas na memória do agente
+    }
+
+    setMessages(restored);
+    setUserMessageHistory(restored.filter(msg => msg.role === 'user').map(msg => msg.content));
+
+    addMessage({
+      role: 'system',
+      content: `💾 Sessão "${result.title}" retomada! Histórico reexibido acima · ${result.messageCount} mensagens na memória da IA · modelo: ${result.model}.\nPode continuar de onde parou — a IA segue o raciocínio anterior.`,
+    });
+
+    return result;
+  }, [agent, addMessage]);
 
   const interruptRequest = useCallback(() => {
     agent.interrupt();
@@ -430,7 +490,7 @@ export function useAgent(
     addMessage,
     setApiKey,
     clearHistory,
-    resetMessages,
+    resumeConversation,
     toggleAutoApprove,
     toggleReasoning,
     interruptRequest,
