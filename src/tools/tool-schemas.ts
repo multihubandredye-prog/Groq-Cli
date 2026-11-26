@@ -323,6 +323,24 @@ export const UPDATE_TASKS_SCHEMA: ToolSchema = {
   },
 };
 
+export const ADD_LESSON_SCHEMA: ToolSchema = {
+  type: 'function',
+  function: {
+    name: 'add_lesson',
+    description: 'Persiste uma preferência ou correção duradoura do usuário (carregada em TODAS as sessões futuras). Use sempre que o usuário corrigir ou expressar uma preferência permanente, ex.: sempre incluir o background-color completo ao pedir cor de botão.',
+    parameters: {
+      type: 'object',
+      properties: {
+        lesson: {
+          type: 'string',
+          description: 'Regra curta e imperativa no idioma do usuário (max ~200 chars), ex.: "Quando pedir cor de botão, sempre definir background-color completo no CSS".',
+        },
+      },
+      required: ['lesson'],
+    },
+  },
+};
+
 export const ALL_TOOL_SCHEMAS = [
   READ_FILE_SCHEMA,
   GREP_FILE_SCHEMA,
@@ -334,6 +352,7 @@ export const ALL_TOOL_SCHEMAS = [
   LIST_FILES_SCHEMA,
   CREATE_TASKS_SCHEMA,
   UPDATE_TASKS_SCHEMA,
+  ADD_LESSON_SCHEMA,
   EXECUTE_COMMAND_SCHEMA,
 ];
 
@@ -344,6 +363,7 @@ export const SAFE_TOOLS = [
   'search_files',
   'create_tasks',
   'update_tasks',
+  'add_lesson',
 ];
 
 export const APPROVAL_REQUIRED_TOOLS = [

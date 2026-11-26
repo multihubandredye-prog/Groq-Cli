@@ -9,6 +9,8 @@ import { statsCommand } from './definitions/stats.js';
 import { sessionsCommand } from './definitions/sessions.js';
 import { resumeCommand } from './definitions/resume.js';
 import { renameCommand } from './definitions/rename.js';
+import { lessonCommand } from './definitions/lesson.js';
+import { lessonsCommand } from './definitions/lessons.js';
 
 const availableCommands: CommandDefinition[] = [
   helpCommand,
@@ -21,6 +23,8 @@ const availableCommands: CommandDefinition[] = [
   sessionsCommand,
   resumeCommand,
   renameCommand,
+  lessonCommand,
+  lessonsCommand,
 ];
 
 export function getAvailableCommands(): CommandDefinition[] {

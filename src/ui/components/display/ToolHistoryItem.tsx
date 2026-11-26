@@ -127,6 +127,16 @@ export default function ToolHistoryItem({ execution }: ToolHistoryItemProps) {
       return result?.message ? <Text color="gray">{result.message}</Text> : null;
     }
 
+    // Lição memorizada → exibição dedicada
+    if (toolName === 'add_lesson' && content?.lesson) {
+      return (
+        <Box flexDirection="column">
+          <Text color="magenta">💾 {content.lesson}</Text>
+          <Text color="gray" dimColor>memorizada para todas as sessões futuras</Text>
+        </Box>
+      );
+    }
+
     // Default handling — sempre limitado para não redesenhar tela gigante
     const rawDefault = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
     const clippedDefault = clipOutput(rawDefault);

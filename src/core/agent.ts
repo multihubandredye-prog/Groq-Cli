@@ -16,6 +16,7 @@ import {
   saveSession,
   findSessionByQuery,
 } from '../utils/session-store.js';
+import { buildLessonsPromptBlock, loadLessons } from '../utils/lessons.js';
 import fs from 'fs';
 import path from 'path';
 
@@ -144,6 +145,8 @@ export class Agent {
   private sessionCreatedAt = new Date().toISOString();
   private sessionTitle = '';
   private approvedFiles = new Set<string>();
+  private lessonsFingerprint = '';
+  private checklistAskedThisTurn = false;
 
   private constructor(
     model: string,
@@ -169,6 +172,13 @@ export class Agent {
 
     // Add system message to conversation
     this.messages.push({ role: 'system', content: this.systemMessage });
+
+    // Inject user lessons (memória de preferências/correções de ~/.groq/lessons.md)
+    const lessonsBlock = buildLessonsPromptBlock();
+    if (lessonsBlock) {
+      this.messages.push({ role: 'system', content: lessonsBlock });
+      this.lessonsFingerprint = this.getLessonsFingerprint();
+    }
 
     // Load project context if available
     try {
@@ -237,6 +247,10 @@ LARGE-FILE WORKFLOW (files >500 lines, e.g. single-file HTML apps):
 3. read_file with start_line/end_line for a small window if context is missing
 4. edit_file (exact text) or replace_lines (exact line range)
 5. verify with grep_file
+
+SELF-VERIFICATION (AUTO): if you edited files in this turn, BEFORE finishing re-check EVERY user request against the final file with grep_file (e.g. did the requested background-color actually land on the button?). If anything requested is missing, fix it now. End with a short checklist of what was done.
+
+MEMORY: when the user corrects you or states a durable preference, save it immediately with add_lesson so you remember it in ALL future sessions.
 
 STRICT RULES:
 - MANDATORY: read_file or grep_file the target file before any edit_file/replace_lines.
@@ -359,6 +373,31 @@ When asked about your identity, identify yourself as a coding assistant running 
 
   public getCurrentModel(): string {
     return this.model;
+  }
+
+  private getLessonsFingerprint(): string {
+    try {
+      const lessons = loadLessons();
+      return `${lessons.length}|${lessons.map(l => l.length).join(',')}`;
+    } catch {
+      return '0|';
+    }
+  }
+
+  /** Recarrega o bloco de lições se ~/.groq/lessons.md mudou (ex.: /lesson na mesma sessão). */
+  private refreshLessonsBlock(): void {
+    const fingerprint = this.getLessonsFingerprint();
+    if (fingerprint === this.lessonsFingerprint) return;
+    this.lessonsFingerprint = fingerprint;
+
+    this.messages = this.messages.filter(
+      m => !(m.role === 'system' && (m.content || '').startsWith('[LIÇÕES MEMORIZADAS'))
+    );
+    const block = buildLessonsPromptBlock();
+    if (block) {
+      this.messages.push({ role: 'system', content: block });
+    }
+    debugLog('Lessons block refreshed', { fingerprint, hasBlock: !!block });
   }
 
   public setSessionAutoApprove(enabled: boolean): void {
@@ -804,6 +843,11 @@ When asked about your identity, identify yourself as a coding assistant running 
       this.sessionTitle = userInput.replace(/\s+/g, ' ').trim().slice(0, 48) || 'Sessão sem título';
     }
 
+    // Recarrega lições do usuário (se ~/.groq/lessons.md mudou) e zera o checklist do turno
+    this.refreshLessonsBlock();
+    this.checklistAskedThisTurn = false;
+    const editsAtStart = this.editLedger.length;
+
     const maxIterations = 50;
     let iteration = 0;
 
@@ -909,6 +953,20 @@ When asked about your identity, identify yourself as a coding assistant running 
 
           // No tool calls, this is the final response
           const content = message.content || '';
+
+          // AUTO-VERIFICAÇÃO: houve edições neste turno → exigir checklist 1x antes de encerrar.
+          // É o que impede a IA de "esquecer" um pedido (ex.: cor de fundo de um botão)!
+          if (this.editLedger.length > editsAtStart && !this.checklistAskedThisTurn) {
+            this.checklistAskedThisTurn = true;
+            debugLog('Triggering mandatory self-verification checklist');
+            this.messages.push({
+              role: 'system',
+              content: '[AUTO-VERIFICAÇÃO OBRIGATÓRIA] Você editou arquivos neste turno, mas AINDA NÃO encerrou. Passos: (1) releia TODOS os pedidos feitos pelo usuário nesta última mensagem; (2) para CADA pedido, confirme com grep_file ou read_file que a mudança está REALMENTE presente no arquivo final (ex.: a cor de fundo pedida está aplicada no botão certo?); (3) se algo pedido ficou faltando ou parcial, faça a edição agora; (4) só então dê a resposta final com um checklist curto por item: ✓ concluído ou ⚠️ pendente.',
+            });
+            iteration++;
+            continue;
+          }
+
           debugLog('Final response - no tool calls detected');
           debugLog('Final content length:', content.length);
           debugLog('Final content preview:', content.substring(0, 200));

@@ -182,7 +182,7 @@ function MessageHistory({ messages, showReasoning = true, usageData }: MessageHi
             Assistente de código Groq com streaming em tempo real, memória de sessão e failover automático de modelos.
           </Text>
           <Text color="gray" dimColor italic>
-            Dicas: /resume abre o seletor de conversas salvas (↑/↓ + Enter) · /rename renomeia · /help para todos os comandos.
+            Dicas: /resume retoma conversas · /lesson ensina uma preferência permanente · /help para todos os comandos.
           </Text>
         </Box>
       ) : (

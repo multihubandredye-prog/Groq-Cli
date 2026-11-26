@@ -5,6 +5,7 @@ import { promisify } from 'util';
 import { writeFile, createDirectory, displayTree, resolveSmartPath, canonicalizePath } from '../utils/file-ops.js';
 import { buildFileOutline, grepInFileContent } from '../utils/code-intel.js';
 import { setReadFilesTracker, markFileAsRead } from './validators.js';
+import { addLesson } from '../utils/lessons.js';
 
 const execAsync = promisify(exec);
 
@@ -69,6 +70,7 @@ export function formatToolParams(
     execute_command: ['command'],
     create_tasks: [],
     update_tasks: [],
+    add_lesson: [],
   };
 
   const keyParams = paramMappings[toolName] || [];
@@ -905,6 +907,7 @@ export const TOOL_REGISTRY = {
   execute_command: executeCommand,
   create_tasks: createTasks,
   update_tasks: updateTasks,
+  add_lesson: addLessonTool,
 };
 
 export async function executeTool(toolName: string, toolArgs: Record<string, any>): Promise<ToolResult> {
@@ -964,6 +967,8 @@ export async function executeTool(toolName: string, toolArgs: Record<string, any
         return await createTasks(toolArgs.user_query, toolArgs.tasks);
       case 'update_tasks':
         return await updateTasks(toolArgs.task_updates);
+      case 'add_lesson':
+        return await addLessonTool(toolArgs.lesson);
       default:
         return createToolResponse(false, undefined, '', 'Error: Tool not implemented');
     }
@@ -972,5 +977,27 @@ export async function executeTool(toolName: string, toolArgs: Record<string, any
       return createToolResponse(false, undefined, '', 'Error: Invalid tool arguments');
     }
     return createToolResponse(false, undefined, '', `Error: Unexpected tool error - ${error}`);
+  }
+}
+
+/**
+ * Memória de lições: persiste uma preferência/correção do usuário em
+ * ~/.groq/lessons.md (carregada em TODAS as sessões futuras).
+ */
+export async function addLessonTool(lesson: string): Promise<ToolResult> {
+  try {
+    if (!lesson || typeof lesson !== 'string') {
+      return createToolResponse(false, undefined, '', 'Error: add_lesson requires a non-empty "lesson" text');
+    }
+    const result = addLesson(lesson);
+    if (!result.added && result.duplicate) {
+      return createToolResponse(true, { lesson: result.lesson, total: result.lessons.length }, `Lição já estava memorizada: "${result.lesson}" (${result.lessons.length} lições no total). Nada duplicado.`);
+    }
+    if (!result.added) {
+      return createToolResponse(false, undefined, '', 'Error: lesson text too short or invalid');
+    }
+    return createToolResponse(true, { lesson: result.lesson, total: result.lessons.length }, `✓ Lição memorizada para TODAS as sessões futuras: "${result.lesson}" (${result.lessons.length} lições no total). Confirme em uma frase curta.`);
+  } catch (error) {
+    return createToolResponse(false, undefined, '', `Error: Failed to save lesson - ${error}`);
   }
 }
